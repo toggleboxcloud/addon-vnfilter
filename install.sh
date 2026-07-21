@@ -56,14 +56,26 @@ fi
 
 STAGING=0
 if [[ -n "$DEST_ROOT" ]]; then
+    DEST_ROOT="$(realpath -m -- "$DEST_ROOT")"
+    [[ "$DEST_ROOT" != "/" ]] ||
+        { echo "--dest-root must not resolve to /" >&2; exit 2; }
     STAGING=1
-    ONE_VAR="${DEST_ROOT%/}/var/lib/one"
+    ONE_VAR="$DEST_ROOT/var/lib/one"
 elif [[ -n "${ONE_LOCATION:-}" ]]; then
     ONE_VAR="${ONE_LOCATION%/}/var"
 else
     ONE_VAR="${ONE_VAR:-/var/lib/one}"
 fi
 REMOTES="$ONE_VAR/remotes"
+
+as_oneadmin()
+{
+    if [[ $EUID -eq 0 ]]; then
+        runuser -u "$ONE_USER" -- "$@"
+    else
+        "$@"
+    fi
+}
 
 FILES=(
     "remotes/hooks/alias_ip/vnfilter.rb|hooks/alias_ip/vnfilter.rb|0755"
@@ -81,7 +93,7 @@ LINKS=(
 hook_matches()
 {
     [[ $STAGING -eq 0 ]] || return 0
-    runuser -u oneadmin -- onehook show vnfilter >/dev/null 2>&1
+    as_oneadmin onehook show vnfilter >/dev/null 2>&1
 }
 
 check_install()
@@ -139,10 +151,10 @@ for entry in "${LINKS[@]}"; do
 done
 
 if [[ $STAGING -eq 0 && -z "$NO_HOOKS" ]]; then
-    if runuser -u oneadmin -- onehook show vnfilter >/dev/null 2>&1; then
-        runuser -u oneadmin -- onehook update vnfilter "$PWD/vnfilter.hooktemplate"
+    if as_oneadmin onehook show vnfilter >/dev/null 2>&1; then
+        as_oneadmin onehook update vnfilter "$PWD/vnfilter.hooktemplate"
     else
-        runuser -u oneadmin -- onehook create "$PWD/vnfilter.hooktemplate"
+        as_oneadmin onehook create "$PWD/vnfilter.hooktemplate"
     fi
 fi
 
@@ -152,4 +164,3 @@ fi
 
 check_install
 echo "Vnfilter installation completed"
-
