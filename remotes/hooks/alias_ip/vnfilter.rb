@@ -94,35 +94,6 @@ def get_data(xpath, entries)
     data
 end
 
-def get_vrrp_data(nic_id)
-    vrrp_data = {
-        :vips => [],
-        :vmacs => []
-    }
-    
-    # Look for VIP_NICx_y and VMAC_NICx_y attributes in the template
-    VM_XML.xpath("//TEMPLATE/*[starts-with(name(),'VIP_NIC#{nic_id}_')]").each do |node|
-        if node.name =~ /VIP_NIC#{nic_id}_(\d+)/
-            index = $1.to_i
-            vrrp_data[:vips][index] = node.text
-        end
-    end
-    
-    VM_XML.xpath("//TEMPLATE/*[starts-with(name(),'VMAC_NIC#{nic_id}_')]").each do |node|
-        if node.name =~ /VMAC_NIC#{nic_id}_(\d+)/
-            index = $1.to_i
-            vrrp_data[:vmacs][index] = node.text
-        end
-    end
-    
-    # Remove nil entries
-    vrrp_data[:vips].compact!
-    vrrp_data[:vmacs].compact!
-    
-    log("VRRP data for NIC #{nic_id}: VIPs=#{vrrp_data[:vips].join(',')}, VMACs=#{vrrp_data[:vmacs].join(',')}")
-    vrrp_data
-end
-
 def alias_nic_data()
     xpath = '//TEMPLATE/NIC_ALIAS[ATTACH="YES"]'
     entries = %w[ALIAS_ID PARENT_ID NAME IP IP6 IP6_GLOBAL IP6_LINK
@@ -146,7 +117,6 @@ def vm_data()
     vm[:a] = alias_nic_data()
     nic_id = vm[:a][:parent_id]
     vm[:n] = nic_data(nic_id)
-    vm[:vrrp] = get_vrrp_data(nic_id)
 
     vm[:nicdev] = "#{vm[:domain]}-#{nic_id}"
     vm[:a][:idx] = vm[:a][:name].split('_ALIAS')[1].to_i
@@ -176,7 +146,6 @@ def run(cmds)
 end
 
 def toggle_ebtables_filter(vm)
-    # Handle regular alias IPs
     if !vm[:a][:ip].nil? and !vm[:a][:ip].empty?
         action = vm[:action]=='add'? '-A' : '-D'
         ['i', 'o'].each do |d|
@@ -186,24 +155,9 @@ def toggle_ebtables_filter(vm)
                  chain, '-p', 'ARP', rule, vm[:a][:ip], '-j', 'RETURN'])
         end
     end
-    
-    # Handle VRRP VIPs
-    if !vm[:vrrp][:vips].nil? and !vm[:vrrp][:vips].empty?
-        action = vm[:action]=='add'? '-A' : '-D'
-        vm[:vrrp][:vips].each do |vip|
-            ['i', 'o'].each do |d|
-                rule = d=='o'? '--arp-ip-dst' : '--arp-ip-src'
-                chain = "#{vm[:nicdev]}-#{d}-arp4"
-                log("#{vm[:action]} VRRP VIP #{vip} to ebtables chain #{chain}")
-                run(['sudo', 'ebtables', '--concurrent', '-t', 'nat', action,
-                     chain, '-p', 'ARP', rule, vip, '-j', 'RETURN'])
-            end
-        end
-    end
 end
 
 def toggle_ipset_filter(vm)
-    # Handle regular IPs
     ['IP', 'IP6', 'IP6_GLOBAL'].each do |e|
         key = e.downcase.to_sym
         if !vm[:a][key].nil? and !vm[:a][key].empty?
@@ -218,15 +172,6 @@ def toggle_ipset_filter(vm)
                 link = vm[:a][:ip6_link]
                 run(['sudo', 'ipset', '-exist', vm[:action], chain, link])
             end
-        end
-    end
-    
-    # Handle VRRP VIPs
-    if !vm[:vrrp][:vips].nil? and !vm[:vrrp][:vips].empty?
-        vm[:vrrp][:vips].each do |vip|
-            chain = "#{vm[:nicdev]}-ip-spoofing"
-            log("#{vm[:action]} VRRP VIP #{vip} to ipset #{chain}")
-            run(['sudo', 'ipset', '-exist', vm[:action], chain, vip])
         end
     end
 end

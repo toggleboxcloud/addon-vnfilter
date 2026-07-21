@@ -1,150 +1,155 @@
 #!/bin/bash
-
-# -------------------------------------------------------------------------- #
-# Copyright 2002-2024, StorPool                                              #
-# Portion copyright OpenNebula Project, OpenNebula Systems                   #
-#                                                                            #
-# Licensed under the Apache License, Version 2.0 (the "License"); you may    #
-# not use this file except in compliance with the License. You may obtain    #
-# a copy of the License at                                                   #
-#                                                                            #
-# http://www.apache.org/licenses/LICENSE-2.0                                 #
-#                                                                            #
-# Unless required by applicable law or agreed to in writing, software        #
-# distributed under the License is distributed on an "AS IS" BASIS,          #
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.   #
-# See the License for the specific language governing permissions and        #
-# limitations under the License.                                             #
-#--------------------------------------------------------------------------- #
-
-set -e -o pipefail
+set -euo pipefail
 
 PATH="/bin:/usr/bin:/sbin:/usr/sbin:${PATH}"
 
-CP_ARG=${CP_ARG:--vLf}
-
+ACTION="install"
+DEST_ROOT=""
+NO_SYNC="${SKIP_HOSTS_SYNC:-}"
+NO_HOOKS="${SKIP_ONEHOOK_REGISTRATION:-}"
 ONE_USER="${ONE_USER:-oneadmin}"
 ONE_GROUP="${ONE_GROUP:-oneadmin}"
-ONE_ETC="${ONE_ETC:-/etc/one}"
-ONE_VAR="${ONE_VAR:-/var/lib/one}"
-ONE_LIB="${ONE_LIB:-/usr/lib/one}"
 
-if [[ -n "${ONE_LOCATION}" ]]; then
-    ONE_ETC="${ONE_LOCATION}/etc"
-    ONE_VAR="${ONE_LOCATION}/var"
-    ONE_LIB="${ONE_LOCATION}/lib"
-fi
-
-[[ "${0/\//}" != "$0" ]] && cd "${0%/*}"
-
-CWD=$(pwd)
-export CWD
-
-function boolTrue()
+usage()
 {
-   case "${!1^^}" in
-       1|Y|YES|T|TRUE|ON)
-           return 0
-           ;;
-       *)
-           return 1
-   esac
+    echo "Usage: $0 [--check] [--dest-root DIR] [--no-sync] [--no-hooks]"
 }
 
-function do_patch()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) ACTION="check" ;;
+        --dest-root)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            DEST_ROOT="$2"
+            shift
+            ;;
+        --no-sync) NO_SYNC=1 ;;
+        --no-hooks) NO_HOOKS=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[[ "${0///}" != "$0" ]] && cd "${0%/*}"
+
+if [[ -n "${HOST_INSTALL:-}" ]]; then
+    if [[ "$ACTION" == "check" ]]; then
+        command -v ruby >/dev/null
+        command -v ebtables-save >/dev/null
+        echo "Vnfilter host prerequisites are available"
+        exit 0
+    fi
+    [[ -z "$DEST_ROOT" ]] || { echo "HOST_INSTALL cannot be combined with --dest-root" >&2; exit 2; }
+    [[ $EUID -eq 0 ]] || { echo "HOST_INSTALL must run as root" >&2; exit 1; }
+    if ! rpm -q opennebula-rubygems >/dev/null 2>&1; then
+        dnf -y install opennebula-rubygems
+    fi
+    if ! runuser -u oneadmin -- sudo -n /usr/sbin/ebtables-save >/dev/null 2>&1; then
+        printf '%s\n' 'oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables-save' > /etc/sudoers.d/vnfilter
+        chmod 0440 /etc/sudoers.d/vnfilter
+        visudo -cf /etc/sudoers.d/vnfilter
+    fi
+    echo "Vnfilter host prerequisites installed"
+    exit 0
+fi
+
+STAGING=0
+if [[ -n "$DEST_ROOT" ]]; then
+    STAGING=1
+    ONE_VAR="${DEST_ROOT%/}/var/lib/one"
+elif [[ -n "${ONE_LOCATION:-}" ]]; then
+    ONE_VAR="${ONE_LOCATION%/}/var"
+else
+    ONE_VAR="${ONE_VAR:-/var/lib/one}"
+fi
+REMOTES="$ONE_VAR/remotes"
+
+FILES=(
+    "remotes/hooks/alias_ip/vnfilter.rb|hooks/alias_ip/vnfilter.rb|0755"
+    "remotes/vnm/vnfilter.rb|vnm/vnfilter.rb|0644"
+    "remotes/vnm/vnfilter_post|vnm/vnfilter_post|0755"
+    "remotes/vnm/vnfilter_clean|vnm/vnfilter_clean|0755"
+)
+LINKS=(
+    "vnm/802.1Q/post.d/vnfilter_post|../../vnfilter_post"
+    "vnm/802.1Q/clean.d/vnfilter_clean|../../vnfilter_clean"
+    "vnm/fw/post.d/vnfilter_post|../../vnfilter_post"
+    "vnm/fw/clean.d/vnfilter_clean|../../vnfilter_clean"
+)
+
+hook_matches()
 {
-    local _patch="$1" _backup="$2"
-    #check if patch is applied
-    echo "*** Testing patch ${_patch##*/}"
-    if patch --dry-run --reverse --forward --strip=0 --input="${_patch}" 2>/dev/null >/dev/null; then
-        echo "   *** Patch file ${_patch##*/} already applied?"
-    else
-        if patch --dry-run --forward --strip=0 --input="${_patch}" 2>/dev/null >/dev/null; then
-            echo "   *** Apply patch ${_patch##*/}"
-            if [[ -n "${_backup}" ]]; then
-                read -ra _backup <<<"--backup --version-control=numbered"
-            else
-                read -ra _backup <<<"--no-backup-if-mismatch"
-            fi
-            if patch "${_backup[@]}" --strip=0 --forward --input="${_patch}"; then
-                DO_PATCH="done"
-            else
-                DO_PATCH="failed"
-            fi
-            echo "--- patch ${_patch} ${DO_PATCH}"
-        else
-            echo "   *** Note! Can't apply patch ${_patch}! Please merge manually."
-        fi
-    fi
+    [[ $STAGING -eq 0 ]] || return 0
+    runuser -u oneadmin -- onehook show vnfilter >/dev/null 2>&1
 }
 
-oneVersion(){
-    read -ra _arr <<<"${1//\./ }"
-    export ONE_MAJOR="${_arr[0]}"
-    export ONE_MINOR="${_arr[1]}"
-    export ONE_VERSION=$((_arr[0]*10000 + _arr[1]*100 + _arr[2]))
-    if [[ ${#_arr[*]} -eq 4 ]] || [[ ${ONE_VERSION} -lt 51200 ]]; then
-        export ONE_EDITION="CE${_arr[3]}"
-    else
-        export ONE_EDITION="EE"
+check_install()
+{
+    local failed=0 entry src rel mode link_rel target actual
+    for entry in "${FILES[@]}"; do
+        IFS='|' read -r src rel mode <<< "$entry"
+        if ! cmp -s "$src" "$REMOTES/$rel"; then
+            echo "DIFF $REMOTES/$rel"
+            failed=1
+        fi
+    done
+    for entry in "${LINKS[@]}"; do
+        IFS='|' read -r link_rel target <<< "$entry"
+        actual=""
+        [[ -L "$REMOTES/$link_rel" ]] && actual="$(readlink "$REMOTES/$link_rel")"
+        if [[ "$actual" != "$target" ]]; then
+            echo "LINK $REMOTES/$link_rel -> ${actual:-missing} (expected $target)"
+            failed=1
+        fi
+    done
+    if [[ -z "$NO_HOOKS" ]] && ! hook_matches; then
+        echo "HOOK vnfilter missing"
+        failed=1
     fi
+    [[ $failed -eq 0 ]]
 }
 
-if [[ -f "${ONE_VAR}/remotes/VERSION" ]]; then
-    [[ -n "${ONE_VER}" ]] || ONE_VER="$(< "${ONE_VAR}/remotes/VERSION")"
+if [[ "$ACTION" == "check" ]]; then
+    check_install
+    echo "Vnfilter installation matches source"
+    exit 0
 fi
 
-oneVersion "${ONE_VER}"
-
-TMPDIR="$(mktemp -d addon-storpool-install-XXXXXXXX)"
-export TMPDIR
-# shellcheck disable=SC2064
-trap "rm -rf \"${TMPDIR}\"" EXIT QUIT TERM
-
-if [[ -f "scripts/install-${ONE_VER}.sh" ]]; then
-    # shellcheck source=/dev/null
-    source "scripts/install-${ONE_VER}.sh"
-elif [[ -f "scripts/install-${ONE_MAJOR}.${ONE_MINOR}.sh" ]]; then
-    # shellcheck source=/dev/null
-    source "scripts/install-${ONE_MAJOR}.${ONE_MINOR}.sh"
-else
-    echo "ERROR: Unknown OpenNebula version '${ONE_VER}' detected!"
-    echo "Please follow the manual installation procedure described in the README.md file."
-    echo "Probably some adjustments will be needed."
-    echo
+if [[ $STAGING -eq 0 && $EUID -ne 0 ]]; then
+    echo "Live installation must run as root" >&2
+    exit 1
 fi
 
-if [[ -z "${HOST_INSTALL}" ]]; then
-    echo "*** copy files ..."
-    while read -ru "${fds}" fname; do
-        dstpath="/var/lib/one/${fname%/*}"
-        [[ -d "${dstpath}" ]] || sudo mkdir -v "${dstpath}"
-        sudo cp -vLf "${fname}" "${dstpath}"/
-    done {fds}< <(find remotes/ -type f -o -type l || true)
-
-    echo "*** set file ownership ..."
-    sudo chown -R "${ONE_USER}":"${ONE_GROUP}" /var/lib/one/remotes/
-
-    if [[ -z "${SKIP_HOSTS_SYNC}" ]]; then
-        echo "*** sync hosts ..."
-        su - oneadmin -c 'onehost sync --force'
+for entry in "${FILES[@]}"; do
+    IFS='|' read -r src rel mode <<< "$entry"
+    install -D -m "$mode" "$src" "$REMOTES/$rel"
+    if [[ $STAGING -eq 0 ]]; then
+        chown "$ONE_USER:$ONE_GROUP" "$REMOTES/$rel"
     fi
-    if [[ -z "${SKIP_ONEHOOK_REGISTRATION}" ]]; then
-        if [[ -f vnfilter.hooktemplate ]]; then
-            echo "*** register the vnfilter hook ..."
-            onehook show "vnfilter" || onehook create vnfilter.hooktemplate
-        else
-            echo "*** Error: vnfilter.hooktemplate not found!"
-            echo "*** Please define the vnfilter hook manually"
-        fi
+done
+
+for entry in "${LINKS[@]}"; do
+    IFS='|' read -r link_rel target <<< "$entry"
+    mkdir -p "$(dirname "$REMOTES/$link_rel")"
+    ln -sfn "$target" "$REMOTES/$link_rel"
+    if [[ $STAGING -eq 0 ]]; then
+        chown -h "$ONE_USER:$ONE_GROUP" "$REMOTES/$link_rel"
     fi
-else
-    # on the hosts
-    sudo dnf -y install opennebula-rubygems || \
-    sudo apt -y install opennebula-rubygems || \
-    sudo yum -y install rubygem-nokogiri || \
-    echo -e "\n*** Please install rubygem nokogiri.\n"
-    echo "oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables-save" | sudo tee /etc/sudoers.d/vnfilter
-    sudo chmod 0440 /etc/sudoers.d/vnfilter
+done
+
+if [[ $STAGING -eq 0 && -z "$NO_HOOKS" ]]; then
+    if runuser -u oneadmin -- onehook show vnfilter >/dev/null 2>&1; then
+        runuser -u oneadmin -- onehook update vnfilter "$PWD/vnfilter.hooktemplate"
+    else
+        runuser -u oneadmin -- onehook create "$PWD/vnfilter.hooktemplate"
+    fi
 fi
+
+if [[ $STAGING -eq 0 && -z "$NO_SYNC" ]]; then
+    runuser -u oneadmin -- onehost sync --force
+fi
+
+check_install
+echo "Vnfilter installation completed"
 

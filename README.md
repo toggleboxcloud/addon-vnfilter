@@ -13,6 +13,27 @@ The currently supported VN MADs are _802.1Q_ and _fw_(Bridged & Security Groups)
 
 ## Installation
 
+The supported installation workflow is:
+
+```bash
+sudo ./install.sh
+```
+
+It installs the deployed vnfilter files, creates the `802.1Q` and `fw`
+post/clean links, registers or updates the `vnfilter` hook, and runs
+`onehost sync --force`.
+
+- `./install.sh --dest-root DIR` installs into an isolated staging root and
+  never changes hooks or hosts.
+- `./install.sh --check` verifies the live installation.
+- `--no-sync` and `--no-hooks` disable those operations when required.
+- `sudo HOST_INSTALL=1 ./install.sh` validates and installs host prerequisites.
+
+For safe removal, run `sudo ./uninstall_vnfilter.sh step1`, migrate or restart
+affected VMs, and then run `sudo ./uninstall_vnfilter.sh step2`.
+
+The manual commands below are retained for reference.
+
 Copy the files on the front-end and change the ownership to the oneadmin user
 
 ```bash
