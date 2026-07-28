@@ -35,10 +35,16 @@ done
 
 if [[ -n "${HOST_INSTALL:-}" ]]; then
     if [[ "$ACTION" == "check" ]]; then
+        # This mode verifies HOST PREREQUISITES ONLY. It does not compare any
+        # deployed file against source. Say so unambiguously and exit non-zero
+        # so a caller cannot mistake it for a content check: a stray
+        # HOST_INSTALL in the environment previously turned --check into a
+        # silent pass.
         command -v ruby >/dev/null
         command -v ebtables-save >/dev/null
         echo "Vnfilter host prerequisites are available"
-        exit 0
+        echo "NOT A CONTENT CHECK: HOST_INSTALL is set, so no deployed file was compared." >&2
+        exit 3
     fi
     [[ -z "$DEST_ROOT" ]] || { echo "HOST_INSTALL cannot be combined with --dest-root" >&2; exit 2; }
     [[ $EUID -eq 0 ]] || { echo "HOST_INSTALL must run as root" >&2; exit 1; }
