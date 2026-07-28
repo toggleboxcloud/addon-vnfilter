@@ -1,0 +1,9 @@
+# kind	source	destination	mode-or-link-target
+file	remotes/hooks/alias_ip/vnfilter.rb	/var/lib/one/remotes/hooks/alias_ip/vnfilter.rb	0755
+file	remotes/vnm/vnfilter.rb	/var/lib/one/remotes/vnm/vnfilter.rb	0644
+file	remotes/vnm/vnfilter_post	/var/lib/one/remotes/vnm/vnfilter_post	0755
+file	remotes/vnm/vnfilter_clean	/var/lib/one/remotes/vnm/vnfilter_clean	0755
+link	-	/var/lib/one/remotes/vnm/802.1Q/post.d/vnfilter_post	../../vnfilter_post
+link	-	/var/lib/one/remotes/vnm/802.1Q/clean.d/vnfilter_clean	../../vnfilter_clean
+link	-	/var/lib/one/remotes/vnm/fw/post.d/vnfilter_post	../../vnfilter_post
+link	-	/var/lib/one/remotes/vnm/fw/clean.d/vnfilter_clean	../../vnfilter_clean

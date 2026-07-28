@@ -83,18 +83,24 @@ as_oneadmin()
     fi
 }
 
-FILES=(
-    "remotes/hooks/alias_ip/vnfilter.rb|hooks/alias_ip/vnfilter.rb|0755"
-    "remotes/vnm/vnfilter.rb|vnm/vnfilter.rb|0644"
-    "remotes/vnm/vnfilter_post|vnm/vnfilter_post|0755"
-    "remotes/vnm/vnfilter_clean|vnm/vnfilter_clean|0755"
-)
-LINKS=(
-    "vnm/802.1Q/post.d/vnfilter_post|../../vnfilter_post"
-    "vnm/802.1Q/clean.d/vnfilter_clean|../../vnfilter_clean"
-    "vnm/fw/post.d/vnfilter_post|../../vnfilter_post"
-    "vnm/fw/clean.d/vnfilter_clean|../../vnfilter_clean"
-)
+# Single source of truth, shared with the composition generator. Keeping a
+# second copy here let install, --check and lock generation drift apart.
+MANIFEST="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/manifests/cloud-7.2.1.tsv"
+[[ -f "$MANIFEST" ]] || { echo "missing $MANIFEST" >&2; exit 2; }
+
+FILES=()
+LINKS=()
+while IFS=$'\t' read -r kind source destination value; do
+    [[ -n "$kind" && "${kind:0:1}" != "#" ]] || continue
+    rel="${destination#/var/lib/one/remotes/}"
+    [[ "$rel" != "$destination" ]] ||
+        { echo "manifest destination outside remotes: $destination" >&2; exit 2; }
+    case "$kind" in
+        file) FILES+=("$source|$rel|$value") ;;
+        link) LINKS+=("$rel|$value") ;;
+        *)    echo "unknown manifest kind: $kind" >&2; exit 2 ;;
+    esac
+done < "$MANIFEST"
 
 hook_matches()
 {
