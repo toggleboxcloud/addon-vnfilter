@@ -17,16 +17,16 @@ Run every git command as `oneadmin`:
   `opennebula-one` site branch.
 - `deployed/<ref>` - older naming for the same role as `site/*`. Being retired.
 
-`site/cloud-7.2.1` is the newest composition branch. `deployed/cloud-7.0.1` is
+`site/cloud-7.4.0` is the newest composition branch. `deployed/cloud-7.0.1` is
 the older retired naming for the same role, not a newer composition. Confirm
 which commit the 7.2.1 site composition actually pins rather than assuming: the
-pin lives in `site/cloud-7.2.1/components.tsv` on `opennebula-one`'s
-`site/cloud-7.2.1r` branch and nowhere else. The deployed `site/cloud-7.2.1`
+pin lives in `site/cloud-7.4.0/components.tsv` on `opennebula-one`'s
+`site/cloud-7.4.0r` branch and nowhere else. The deployed `site/cloud-7.4.0`
 branch of `opennebula-one` carries no component lock at all — its composed
 installer resolves this repository from `VNFILTER_REPO`.
 
 This file and its `CLAUDE.md` symlink are committed on both `master` and
-`site/cloud-7.2.1`, byte-identical, and are meant to stay that way. Change them
+`site/cloud-7.4.0`, byte-identical, and are meant to stay that way. Change them
 on both branches or neither.
 
 ## Layout
@@ -39,9 +39,9 @@ on both branches or neither.
 - `vncheck.sh`, `debug.sh`, `shellcheck.sh` - verification and linting.
 - `FIX_RACE.md` - notes on the hotplug race this addon has to handle.
 
-Tracked on `site/cloud-7.2.1` only. These paths do **not** exist on `master`:
+Tracked on `site/cloud-7.4.0` only. These paths do **not** exist on `master`:
 
-- `manifests/cloud-7.2.1.tsv` - the deployment manifest. One row per file or
+- `manifests/cloud-7.4.0.tsv` - the deployment manifest. One row per file or
   link `install.sh` writes, with its mode or link target.
 - `safe-install.py` - the confined writer. Byte-identical across
   `addon-storpool-mc`, `addon-smtp_filter` and `addon-vnfilter` by design, so
@@ -60,8 +60,8 @@ That last step touches every host, so it is a deployment action, not a test.
 Use an isolated staging root and skip hooks/sync when validating. Run
 `./shellcheck.sh` before committing shell changes.
 
-On `site/cloud-7.2.1` the installer takes that file list from
-`manifests/cloud-7.2.1.tsv` rather than a hardcoded array, validates the
+On `site/cloud-7.4.0` the installer takes that file list from
+`manifests/cloud-7.4.0.tsv` rather than a hardcoded array, validates the
 manifest in full — the file itself and every row — before the first write, and
 writes through `safe-install.py`, which resolves against `O_NOFOLLOW`
 descriptors beneath a trusted root and sets mode and owner on the descriptor
@@ -87,7 +87,7 @@ run `dnf -y install opennebula-rubygems`, which installs RPM-managed files
 across the system, and — only if the non-interactive `ebtables-save` privilege
 check fails — it writes `/etc/sudoers.d/vnfilter` at mode 0440.
 
-On `site/cloud-7.2.1`, `bash tests/test_manifest_confinement.sh` is the
+On `site/cloud-7.4.0`, `bash tests/test_manifest_confinement.sh` is the
 regression suite for that boundary. Run it as root: the staging fault injection
 needs root and is skipped otherwise, and the run prints the skips it took.
 

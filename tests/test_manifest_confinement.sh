@@ -20,7 +20,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALLER="$REPO_ROOT/install.sh"
-REAL_MANIFEST="$REPO_ROOT/manifests/cloud-7.2.1.tsv"
+REAL_MANIFEST="$REPO_ROOT/manifests/cloud-7.4.0.tsv"
 failed=0
 
 TMP="$(mktemp -d)"
@@ -607,7 +607,7 @@ echo PAYLOAD > "$FAKE/remotes/vnm/good"
 
 e2e() {
     local dest="$1"; shift
-    printf '%s\n' "$@" > "$FAKE/manifests/cloud-7.2.1.tsv"
+    printf '%s\n' "$@" > "$FAKE/manifests/cloud-7.4.0.tsv"
     "$FAKE/install.sh" --dest-root "$dest" --no-hooks --no-sync >/dev/null 2>&1
 }
 
@@ -722,7 +722,7 @@ fi
 # These are live-mode runs (no --dest-root), so they need root for the EUID gate
 # and for the chown to oneadmin. Both write only inside $FAKE, under $TMP.
 if [[ $EUID -eq 0 ]] && id -u oneadmin >/dev/null 2>&1; then
-    printf '%s\n' "$GOOD_ROW" "$LINK_ROW" > "$FAKE/manifests/cloud-7.2.1.tsv"
+    printf '%s\n' "$GOOD_ROW" "$LINK_ROW" > "$FAKE/manifests/cloud-7.4.0.tsv"
 
     # Launched from an unrelated working directory, so a base of "wherever the
     # caller happened to be" would land the tree somewhere else entirely.
@@ -773,11 +773,11 @@ cat > "$SWAP/safe-install.py" <<EOF
 # Not safe-install.py: a stand-in that rewrites the manifest at the moment the
 # installer starts writing, then hands over to the real helper untouched.
 printf 'file\tremotes/vnm/good\t$P/vnm/swapped\t0755\n' \\
-    > "$SWAP/manifests/cloud-7.2.1.tsv"
+    > "$SWAP/manifests/cloud-7.4.0.tsv"
 exec "$REPO_ROOT/safe-install.py" "\$@"
 EOF
 chmod 0755 "$SWAP/install.sh" "$SWAP/safe-install.py"
-printf 'file\tremotes/vnm/good\t%s/vnm/good\t0755\n' "$P" > "$SWAP/manifests/cloud-7.2.1.tsv"
+printf 'file\tremotes/vnm/good\t%s/vnm/good\t0755\n' "$P" > "$SWAP/manifests/cloud-7.4.0.tsv"
 
 D6="$TMP/d6"
 if "$SWAP/install.sh" --dest-root "$D6" --no-hooks --no-sync >/dev/null 2>&1 &&
@@ -790,7 +790,7 @@ fi
 
 # The installer must not fall back to a silent no-op when the manifest is gone.
 D3="$TMP/d3"
-rm -f "$FAKE/manifests/cloud-7.2.1.tsv"
+rm -f "$FAKE/manifests/cloud-7.4.0.tsv"
 if "$FAKE/install.sh" --dest-root "$D3" --no-hooks --no-sync >/dev/null 2>&1; then
     echo "FAIL installer: reported success with no manifest"; failed=1
 else
