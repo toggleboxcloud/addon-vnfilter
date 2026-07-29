@@ -79,11 +79,13 @@ Safe flags for validation:
   Combined with `--check` it reports host prerequisites only and compares no
   deployed file, so it is never a content check.
 
-`HOST_INSTALL=1` is **not** a manifest operation. It writes
-`/etc/sudoers.d/vnfilter` at mode 0440 and returns before the manifest is read
-at all, so that write sits outside the manifest confinement boundary entirely.
-It is also the only thing this addon installs outside the remotes tree — treat
-changes to it as privilege boundary changes.
+`HOST_INSTALL=1` is **not** a manifest operation. It returns before the
+manifest is read at all, so nothing it does is inside the confinement boundary,
+and it is the only path by which this addon touches anything outside the
+remotes tree. Two things happen there, both privilege boundary changes: it may
+run `dnf -y install opennebula-rubygems`, which installs RPM-managed files
+across the system, and — only if the non-interactive `ebtables-save` privilege
+check fails — it writes `/etc/sudoers.d/vnfilter` at mode 0440.
 
 On `site/cloud-7.2.1`, `bash tests/test_manifest_confinement.sh` is the
 regression suite for that boundary. Run it as root: the staging fault injection
