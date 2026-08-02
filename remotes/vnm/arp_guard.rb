@@ -12,6 +12,8 @@ module VnfilterArpGuard
     LOCK_PATH = '/var/tmp/one/.vnfilter-arp-guard.lock'.freeze
     NFT_HELPER = '/usr/local/sbin/vnfilter-arp-guard-nft'.freeze
     TABLE_NAME = 'one_arp_guard'.freeze
+    MISSING_CHAIN_RETRIES = 15
+    MISSING_CHAIN_RETRY_INTERVAL = 2
 
     DEFAULTS = {
         'mode' => 'disabled',
@@ -29,6 +31,7 @@ module VnfilterArpGuard
     class ConfigError < Error; end
     class CommandError < Error; end
     class ReadinessError < Error; end
+    class MissingChainError < ReadinessError; end
 
     Config = Struct.new(
         :mode,
@@ -56,12 +59,18 @@ module VnfilterArpGuard
             config_path: CONFIG_PATH,
             lock_path: LOCK_PATH,
             runner: CommandRunner.new,
-            logger: Syslog::Logger.new('vnfilter_arp_guard')
+            logger: Syslog::Logger.new('vnfilter_arp_guard'),
+            missing_chain_retries: 0,
+            retry_interval: MISSING_CHAIN_RETRY_INTERVAL,
+            sleeper: Kernel.method(:sleep)
         )
             @config_path = config_path
             @lock_path = lock_path
             @runner = runner
             @logger = logger
+            @missing_chain_retries = missing_chain_retries
+            @retry_interval = retry_interval
+            @sleeper = sleeper
         end
 
         def reconcile
@@ -74,8 +83,8 @@ module VnfilterArpGuard
                     return true
                 end
 
-                taps = live_taps(config.bridge)
-                targets = (discover_targets(taps) + config.temporary_targets).uniq.sort
+                taps, discovered_targets = discover_ready_state(config.bridge)
+                targets = (discovered_targets + config.temporary_targets).uniq.sort
                 apply_state(payload(config.mode, config.ingress_interface, targets))
                 @logger.info(
                     "ARP guard reconciled mode=#{config.mode} " \
@@ -237,10 +246,35 @@ module VnfilterArpGuard
 
             taps.flat_map do |tap|
                 chain = "#{tap}-o-arp4"
-                raise ReadinessError, "missing expected ebtables nat chain #{chain}" unless declarations[chain]
+                raise MissingChainError, "missing expected ebtables nat chain #{chain}" unless declarations[chain]
 
                 rules[chain]
             end.uniq.sort
+        end
+
+        def discover_ready_state(bridge)
+            retries_remaining = @missing_chain_retries
+            retry_window = @missing_chain_retries * @retry_interval
+
+            loop do
+                taps = live_taps(bridge)
+                return [taps, discover_targets(taps)]
+            rescue MissingChainError => e
+                raise if retries_remaining.zero?
+
+                if retries_remaining == @missing_chain_retries
+                    unless fail_open
+                        raise CommandError, 'cannot apply fail-open state while waiting for ebtables readiness'
+                    end
+                    @logger.warn(
+                        "ARP guard readiness pending: #{e.message}; " \
+                        "retrying for up to #{retry_window} seconds"
+                    )
+                end
+
+                retries_remaining -= 1
+                @sleeper.call(@retry_interval)
+            end
         end
 
         def parse_ipv4(address, context)
@@ -284,8 +318,14 @@ module VnfilterArpGuard
         end
     end
 
-    def self.reconcile(logger: Syslog::Logger.new('vnfilter_arp_guard'))
-        Reconciler.new(logger: logger).reconcile
+    def self.reconcile(
+        logger: Syslog::Logger.new('vnfilter_arp_guard'),
+        missing_chain_retries: 0
+    )
+        Reconciler.new(
+            logger: logger,
+            missing_chain_retries: missing_chain_retries
+        ).reconcile
     end
 
     def self.fail_open(logger: Syslog::Logger.new('vnfilter_arp_guard'))
@@ -293,4 +333,10 @@ module VnfilterArpGuard
     end
 end
 
-exit(VnfilterArpGuard.reconcile ? 0 : 1) if $PROGRAM_NAME == __FILE__
+if $PROGRAM_NAME == __FILE__
+    exit(
+        VnfilterArpGuard.reconcile(
+            missing_chain_retries: VnfilterArpGuard::MISSING_CHAIN_RETRIES
+        ) ? 0 : 1
+    )
+end
