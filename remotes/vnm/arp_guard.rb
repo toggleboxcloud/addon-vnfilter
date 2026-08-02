@@ -62,7 +62,8 @@ module VnfilterArpGuard
             logger: Syslog::Logger.new('vnfilter_arp_guard'),
             missing_chain_retries: 0,
             retry_interval: MISSING_CHAIN_RETRY_INTERVAL,
-            sleeper: Kernel.method(:sleep)
+            sleeper: Kernel.method(:sleep),
+            clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
         )
             @config_path = config_path
             @lock_path = lock_path
@@ -71,31 +72,75 @@ module VnfilterArpGuard
             @missing_chain_retries = missing_chain_retries
             @retry_interval = retry_interval
             @sleeper = sleeper
+            @clock = clock
         end
 
         def reconcile
-            with_lock do
-                config = load_config
+            retries_remaining = @missing_chain_retries
+            retry_window = @missing_chain_retries * @retry_interval
+            retry_deadline = @clock.call + retry_window
 
-                if config.mode == 'disabled'
-                    apply_state(disabled_payload)
-                    @logger.info('ARP guard reconciled in disabled mode')
-                    return true
+            loop do
+                missing_chain = nil
+                fail_open_succeeded = true
+                result = with_lock do
+                    reconcile_once
+                rescue MissingChainError => e
+                    missing_chain = e
+                    fail_open_succeeded = fail_open
+                    false
+                rescue StandardError => e
+                    @logger.error("ARP guard reconciliation failed: #{e.message}")
+                    fail_open
+                    false
                 end
 
-                taps, discovered_targets = discover_ready_state(config.bridge)
-                targets = (discovered_targets + config.temporary_targets).uniq.sort
-                apply_state(payload(config.mode, config.ingress_interface, targets))
-                @logger.info(
-                    "ARP guard reconciled mode=#{config.mode} " \
-                    "taps=#{taps.length} targets=#{targets.length}"
-                )
-                true
-            rescue StandardError => e
-                @logger.error("ARP guard reconciliation failed: #{e.message}")
-                fail_open
-                false
+                return true if result
+                return false unless missing_chain && fail_open_succeeded
+
+                remaining_time = retry_deadline - @clock.call
+                if retries_remaining.zero? || remaining_time <= 0
+                    @logger.error("ARP guard reconciliation failed: #{missing_chain.message}")
+                    return false
+                end
+
+                if retries_remaining == @missing_chain_retries
+                    @logger.warn(
+                        "ARP guard readiness pending: #{missing_chain.message}; " \
+                        "retrying until #{retry_window}-second deadline"
+                    )
+                end
+
+                retries_remaining -= 1
+                @sleeper.call([@retry_interval, remaining_time].min)
+                if @clock.call >= retry_deadline
+                    @logger.error("ARP guard reconciliation failed: #{missing_chain.message}")
+                    return false
+                end
             end
+        rescue StandardError => e
+            @logger.error("ARP guard reconciliation failed: #{e.message}")
+            with_lock { fail_open }
+            false
+        end
+
+        def reconcile_once
+            config = load_config
+
+            if config.mode == 'disabled'
+                apply_state(disabled_payload)
+                @logger.info('ARP guard reconciled in disabled mode')
+                return true
+            end
+
+            taps = live_taps(config.bridge)
+            targets = (discover_targets(taps) + config.temporary_targets).uniq.sort
+            apply_state(payload(config.mode, config.ingress_interface, targets))
+            @logger.info(
+                "ARP guard reconciled mode=#{config.mode} " \
+                "taps=#{taps.length} targets=#{targets.length}"
+            )
+            true
         end
 
         def fail_open
@@ -250,31 +295,6 @@ module VnfilterArpGuard
 
                 rules[chain]
             end.uniq.sort
-        end
-
-        def discover_ready_state(bridge)
-            retries_remaining = @missing_chain_retries
-            retry_window = @missing_chain_retries * @retry_interval
-
-            loop do
-                taps = live_taps(bridge)
-                return [taps, discover_targets(taps)]
-            rescue MissingChainError => e
-                raise if retries_remaining.zero?
-
-                if retries_remaining == @missing_chain_retries
-                    unless fail_open
-                        raise CommandError, 'cannot apply fail-open state while waiting for ebtables readiness'
-                    end
-                    @logger.warn(
-                        "ARP guard readiness pending: #{e.message}; " \
-                        "retrying for up to #{retry_window} seconds"
-                    )
-                end
-
-                retries_remaining -= 1
-                @sleeper.call(@retry_interval)
-            end
         end
 
         def parse_ipv4(address, context)
