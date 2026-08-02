@@ -1,0 +1,210 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+require 'ipaddr'
+require 'json'
+require 'open3'
+require 'tempfile'
+
+module VnfilterArpGuardNft
+    TABLE_NAME = 'one_arp_guard'.freeze
+    STATE_DIRECTORY = '/var/lib/vnfilter-arp-guard'.freeze
+    STATE_PATH = File.join(STATE_DIRECTORY, 'owner.json').freeze
+    INTERFACE_PATTERN = /\A[a-zA-Z0-9_.:-]{1,15}\z/
+    MODES = %w[disabled observe enforce].freeze
+    PAYLOAD_KEYS = %w[ingress_interface mode targets version].sort.freeze
+    OWNER_STATE = {
+        'version' => 1,
+        'family' => 'bridge',
+        'table' => TABLE_NAME,
+        'owner' => 'addon-vnfilter'
+    }.freeze
+
+    class Error < StandardError; end
+
+    class NftRunner
+        def table_exists?
+            _stdout, stderr, status = Open3.capture3(
+                { 'LC_ALL' => 'C' },
+                '/usr/sbin/nft', 'list', 'table', 'bridge', TABLE_NAME
+            )
+            return true if status.success?
+            return false if stderr.include?('No such file or directory')
+
+            raise Error, "cannot inspect bridge table #{TABLE_NAME}: #{stderr.strip}"
+        end
+
+        def submit(program, check_only:)
+            command = ['/usr/sbin/nft']
+            command << '-c' if check_only
+            command.concat(['-f', '-'])
+            _stdout, stderr, status = Open3.capture3(
+                { 'LC_ALL' => 'C' }, *command, stdin_data: program
+            )
+            raise Error, "nft transaction failed: #{stderr.strip}" unless status.success?
+        rescue SystemCallError => e
+            raise Error, "cannot execute nft: #{e.message}"
+        end
+    end
+
+    class Manager
+        def initialize(
+            runner: NftRunner.new,
+            state_directory: STATE_DIRECTORY,
+            state_path: STATE_PATH
+        )
+            @runner = runner
+            @state_directory = state_directory
+            @state_path = state_path
+        end
+
+        def check(raw_payload)
+            payload = parse_payload(raw_payload)
+            verify_ownership(check_only: true)
+            @runner.submit(program(payload), check_only: true)
+        end
+
+        def apply(raw_payload)
+            payload = parse_payload(raw_payload)
+            verify_ownership(check_only: false)
+            nft_program = program(payload)
+            @runner.submit(nft_program, check_only: true)
+            @runner.submit(nft_program, check_only: false)
+        end
+
+        def remove
+            state = load_state
+            exists = @runner.table_exists?
+            raise Error, "refusing to remove unowned bridge table #{TABLE_NAME}" if state.nil? && exists
+            return unless state
+
+            if exists
+                nft_program = "delete table bridge #{TABLE_NAME}\n"
+                @runner.submit(nft_program, check_only: true)
+                @runner.submit(nft_program, check_only: false)
+            end
+            File.unlink(@state_path) if File.exist?(@state_path)
+        end
+
+        def parse_payload(raw_payload)
+            raise Error, 'payload is too large' if raw_payload.bytesize > 65_536
+
+            payload = JSON.parse(raw_payload)
+            unless payload.is_a?(Hash) && payload.keys.sort == PAYLOAD_KEYS
+                raise Error, 'payload has unexpected fields'
+            end
+            raise Error, 'unsupported payload version' unless payload['version'] == 1
+            raise Error, 'unsupported mode' unless MODES.include?(payload['mode'])
+            unless payload['ingress_interface'].is_a?(String) &&
+                   payload['ingress_interface'].match?(INTERFACE_PATTERN)
+                raise Error, 'invalid ingress interface'
+            end
+            raise Error, 'targets must be an array' unless payload['targets'].is_a?(Array)
+
+            targets = payload['targets'].map do |address|
+                raise Error, 'target must be a string' unless address.is_a?(String)
+
+                parsed = IPAddr.new(address)
+                unless parsed.ipv4? && parsed.to_s == address
+                    raise Error, "invalid IPv4 target #{address.inspect}"
+                end
+                parsed.to_s
+            rescue IPAddr::InvalidAddressError
+                raise Error, "invalid IPv4 target #{address.inspect}"
+            end
+
+            payload.merge('targets' => targets.uniq.sort)
+        rescue JSON::ParserError => e
+            raise Error, "invalid JSON payload: #{e.message}"
+        end
+
+        def program(payload)
+            add_elements = if payload['targets'].empty?
+                               ''
+                           else
+                               "add element bridge #{TABLE_NAME} local_targets " \
+                                   "{ #{payload['targets'].join(', ')} }\n"
+                           end
+            chain = ''
+            unless payload['mode'] == 'disabled'
+                verdict = payload['mode'] == 'enforce' ? ' drop' : ''
+                chain = <<~NFT
+                    add chain bridge #{TABLE_NAME} prerouting { type filter hook prerouting priority -300; policy accept; }
+                    add rule bridge #{TABLE_NAME} prerouting iifname "#{payload['ingress_interface']}" ether daddr ff:ff:ff:ff:ff:ff ether type arp arp operation request arp daddr ip != @local_targets counter#{verdict}
+                NFT
+            end
+
+            <<~NFT
+                add table bridge #{TABLE_NAME}
+                flush table bridge #{TABLE_NAME}
+                add set bridge #{TABLE_NAME} local_targets { type ipv4_addr; }
+                #{add_elements}#{chain}
+            NFT
+        end
+
+        def verify_ownership(check_only:)
+            state = load_state
+            exists = @runner.table_exists?
+            if state.nil? && exists
+                raise Error, "refusing to modify unowned bridge table #{TABLE_NAME}"
+            end
+            write_state unless check_only || state
+        end
+
+        def load_state
+            return nil unless File.exist?(@state_path)
+
+            stat = File.lstat(@state_path)
+            unless stat.file? && stat.uid.zero? && (stat.mode & 0o022).zero?
+                raise Error, "unsafe ownership state #{@state_path}"
+            end
+            state = JSON.parse(File.read(@state_path))
+            raise Error, "invalid ownership state #{@state_path}" unless state == OWNER_STATE
+
+            state
+        rescue JSON::ParserError => e
+            raise Error, "invalid ownership state #{@state_path}: #{e.message}"
+        end
+
+        def write_state
+            FileUtils.mkdir_p(@state_directory, mode: 0o700)
+            directory = File.lstat(@state_directory)
+            unless directory.directory? && directory.uid.zero? && (directory.mode & 0o022).zero?
+                raise Error, "unsafe ownership directory #{@state_directory}"
+            end
+
+            Tempfile.create('.owner.', @state_directory, mode: 0o600) do |file|
+                file.write(JSON.generate(OWNER_STATE))
+                file.write("\n")
+                file.flush
+                file.fsync
+                File.rename(file.path, @state_path)
+            end
+        rescue SystemCallError => e
+            raise Error, "cannot write ownership state: #{e.message}"
+        end
+    end
+
+    def self.run(argv, stdin: $stdin, stderr: $stderr)
+        raise Error, 'helper must run as root' unless Process.euid.zero?
+        raise Error, 'expected exactly one action' unless argv.length == 1
+
+        manager = Manager.new
+        case argv.first
+        when '--check'
+            manager.check(stdin.read)
+        when '--apply'
+            manager.apply(stdin.read)
+        when '--remove'
+            manager.remove
+        else
+            raise Error, 'unsupported action'
+        end
+        0
+    rescue Error => e
+        stderr.puts("vnfilter-arp-guard-nft: #{e.message}")
+        1
+    end
+end
+
+exit(VnfilterArpGuardNft.run(ARGV)) if $PROGRAM_NAME == __FILE__

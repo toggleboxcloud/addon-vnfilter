@@ -19,6 +19,7 @@
 
 require 'vnmmad'
 require 'syslog/logger'
+require_relative 'arp_guard'
 
 # IP filter for aliases
 class VnFilter < VNMMAD::VNMDriver
@@ -49,6 +50,13 @@ class VnFilter < VNMMAD::VNMDriver
         @slog.info "initialize #{xpath_filter} //#{caller[-1]}"
         super(vm_template, xpath_filter, deploy_id)
         @locking = true
+    end
+
+    def reconcile_arp_guard
+        VnfilterArpGuard.reconcile(logger: @slog)
+    rescue StandardError => e
+        @slog.error "ARP guard invocation failed: #{e.message}"
+        false
     end
 
     def ebtables_mutation_command
@@ -309,6 +317,7 @@ class VnFilter < VNMMAD::VNMDriver
                 chain = "one-#{vm_id}-#{parent_id}"
                 if append_ebtables(chain, ipv4)
                     @slog.info "activate() VM #{vm_id} parent_id:#{parent_id} END"
+                    reconcile_arp_guard
                     unlock
                     return
                 end
@@ -446,6 +455,7 @@ class VnFilter < VNMMAD::VNMDriver
             end
         end
         @slog.info "activate() VM #{vm_id} END"
+        reconcile_arp_guard
         unlock
     end
 
@@ -482,6 +492,7 @@ class VnFilter < VNMMAD::VNMDriver
             end
         end
         @slog.info "deactivate() VM #{vm_id} END"
+        reconcile_arp_guard
         unlock
     end
 

@@ -42,6 +42,7 @@ if [[ -n "${HOST_INSTALL:-}" ]]; then
         # silent pass.
         command -v ruby >/dev/null
         command -v ebtables-save >/dev/null
+        test -x /usr/local/sbin/vnfilter-arp-guard-nft
         echo "Vnfilter host prerequisites are available"
         echo "NOT A CONTENT CHECK: HOST_INSTALL is set, so no deployed file was compared." >&2
         exit 3
@@ -51,11 +52,22 @@ if [[ -n "${HOST_INSTALL:-}" ]]; then
     if ! rpm -q opennebula-rubygems >/dev/null 2>&1; then
         dnf -y install opennebula-rubygems
     fi
-    if ! runuser -u oneadmin -- sudo -n /usr/sbin/ebtables-save >/dev/null 2>&1; then
-        printf '%s\n' 'oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables-save' > /etc/sudoers.d/vnfilter
+    install -D -o root -g root -m 0755 \
+        host/vnfilter_arp_guard_nft /usr/local/sbin/vnfilter-arp-guard-nft
+    ARP_GUARD_CHECK_PAYLOAD='{"version":1,"mode":"disabled","ingress_interface":"bond0.1","targets":[]}'
+    if ! runuser -u oneadmin -- sudo -n /usr/sbin/ebtables-save >/dev/null 2>&1 ||
+       ! printf '%s' "$ARP_GUARD_CHECK_PAYLOAD" | runuser -u oneadmin -- \
+           sudo -n /usr/local/sbin/vnfilter-arp-guard-nft --check >/dev/null 2>&1; then
+        printf '%s\n' \
+            'oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables-save' \
+            'oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables' \
+            'oneadmin ALL=(ALL) NOPASSWD: /usr/local/sbin/vnfilter-arp-guard-nft --check, /usr/local/sbin/vnfilter-arp-guard-nft --apply' \
+            > /etc/sudoers.d/vnfilter
         chmod 0440 /etc/sudoers.d/vnfilter
         visudo -cf /etc/sudoers.d/vnfilter
     fi
+    printf '%s' "$ARP_GUARD_CHECK_PAYLOAD" | runuser -u oneadmin -- \
+        sudo -n /usr/local/sbin/vnfilter-arp-guard-nft --check >/dev/null
     echo "Vnfilter host prerequisites installed"
     exit 0
 fi
