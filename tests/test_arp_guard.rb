@@ -80,6 +80,20 @@ class FakeRunner
     end
 end
 
+class SequencedEbtablesRunner < FakeRunner
+    def initialize(ebtables_outputs:, **kwargs)
+        @ebtables_outputs = ebtables_outputs.dup
+        super(ebtables_output: @ebtables_outputs.first, **kwargs)
+    end
+
+    def capture(*command, stdin_data: nil)
+        if command == ['sudo', '-n', '/usr/sbin/ebtables-save']
+            @ebtables_output = @ebtables_outputs.shift unless @ebtables_outputs.empty?
+        end
+        super
+    end
+end
+
 class FakeNftRunner
     attr_accessor :table_exists
     attr_reader :submissions
@@ -141,12 +155,13 @@ class ArpGuardTest
         File.write(@config_path, "mode=#{mode}\n#{extra}")
     end
 
-    def reconciler(runner)
+    def reconciler(runner, **options)
         VnfilterArpGuard::Reconciler.new(
             config_path: @config_path,
             lock_path: @lock_path,
             runner: runner,
-            logger: @logger
+            logger: @logger,
+            **options
         )
     end
 
@@ -188,6 +203,52 @@ class ArpGuardTest
         assert_equal 1, payloads.length
         assert_equal 'disabled', payloads.first['mode']
         assert @logger.messages.any? { |level, message| level == :error && message.include?('missing expected') }
+    end
+
+    def test_missing_live_tap_chain_is_retried_during_standalone_grace_period
+        write_config('enforce')
+        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        runner = SequencedEbtablesRunner.new(
+            ip_output: IP_LINKS,
+            ebtables_outputs: [incomplete, EBTABLES]
+        )
+        sleeps = []
+
+        result = reconciler(
+            runner,
+            missing_chain_retries: 1,
+            retry_interval: 2,
+            sleeper: ->(seconds) { sleeps << seconds }
+        ).reconcile
+
+        assert result
+        assert_equal [2], sleeps
+        assert_equal ['disabled', 'enforce'], guard_payloads(runner).map { |payload| payload['mode'] }
+        assert @logger.messages.any? do |level, message|
+            level == :warn && message.include?('retrying for up to 2 seconds')
+        end
+        refute @logger.messages.any? { |level, _message| level == :error }
+    end
+
+    def test_persistent_missing_live_tap_chain_fails_after_grace_period
+        write_config('enforce')
+        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: incomplete)
+        sleeps = []
+
+        result = reconciler(
+            runner,
+            missing_chain_retries: 2,
+            retry_interval: 2,
+            sleeper: ->(seconds) { sleeps << seconds }
+        ).reconcile
+
+        refute result
+        assert_equal [2, 2], sleeps
+        assert guard_payloads(runner).all? { |payload| payload['mode'] == 'disabled' }
+        assert @logger.messages.any? do |level, message|
+            level == :error && message.include?('missing expected')
+        end
     end
 
     def test_malformed_ebtables_address_fails_open
