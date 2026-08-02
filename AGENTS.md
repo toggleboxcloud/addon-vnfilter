@@ -34,6 +34,7 @@ on both branches or neither.
 - `remotes/` - the driver files that get installed.
 - `patches/` - patches against upstream OpenNebula files.
 - `scripts/` - helpers.
+- `host/vnfilter_arp_guard_nft` - constrained root-owned nft transaction helper.
 - `install.sh`, `uninstall_vnfilter.sh` - install and removal.
 - `vnfilter.hooktemplate` - hook registration template.
 - `vncheck.sh`, `debug.sh`, `shellcheck.sh` - verification and linting.
@@ -82,10 +83,9 @@ Safe flags for validation:
 `HOST_INSTALL=1` is **not** a manifest operation. It returns before the
 manifest is read at all, so nothing it does is inside the confinement boundary,
 and it is the only path by which this addon touches anything outside the
-remotes tree. Two things happen there, both privilege boundary changes: it may
-run `dnf -y install opennebula-rubygems`, which installs RPM-managed files
-across the system, and — only if the non-interactive `ebtables-save` privilege
-check fails — it writes `/etc/sudoers.d/vnfilter` at mode 0440.
+remotes tree. It may install `opennebula-rubygems`, installs the root-owned
+helper at `/usr/local/sbin/vnfilter-arp-guard-nft`, and writes the complete
+`/etc/sudoers.d/vnfilter` policy at mode 0440 when its privilege checks fail.
 
 On `site/cloud-7.2.1`, `bash tests/test_manifest_confinement.sh` is the
 regression suite for that boundary. Run it as root: the staging fault injection

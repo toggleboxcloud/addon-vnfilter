@@ -6,6 +6,7 @@ The following use cases are covered:
 * Alias IPv4 and IPv6 spoofing filtering when Alias is detached from Ethernet only NIC (VNM/clean.d)
 * Alias IPv4 and IPv6 spoofing filtering on Alias hotplug (via Host hook)
 * ARP filtering when FILTER_MAC_SPOOFING is enabled
+* A host-local nftables guard for irrelevant inbound broadcast ARP requests
 
 
 The currently supported VN MADs are _802.1Q_ and _fw_(Bridged & Security Groups).
@@ -27,10 +28,12 @@ post/clean links, registers or updates the `vnfilter` hook, and runs
   never changes hooks or hosts.
 - `./install.sh --check` verifies the live installation.
 - `--no-sync` and `--no-hooks` disable those operations when required.
-- `sudo HOST_INSTALL=1 ./install.sh` validates and installs host prerequisites.
+- `sudo HOST_INSTALL=1 ./install.sh` validates and installs host prerequisites,
+  including the root-owned constrained nft helper.
 
-For safe removal, run `sudo ./uninstall_vnfilter.sh step1`, migrate or restart
-affected VMs, and then run `sudo ./uninstall_vnfilter.sh step2`.
+For safe removal, first follow the ARP guard disable procedure below. Then run
+`sudo ./uninstall_vnfilter.sh step1`, migrate or restart affected VMs, and run
+`sudo ./uninstall_vnfilter.sh step2 --arp-guard-disabled`.
 
 The manual commands below are retained for reference.
 
@@ -60,10 +63,12 @@ For Ubuntu...
 sudo apt -y install opennebula-rubygems
 ```
 
-Enable oneadmin to execute ebtables-save on the hosts.
+Enable oneadmin to execute ebtables commands and the constrained ARP guard
+helper on the hosts. The supported installer manages this policy; do not grant
+raw `nft -f` access.
 
 ```bash
-echo "oneadmin ALL=(ALL) NOPASSWD: /usr/sbin/ebtables-save" |sudo tee /etc/sudoers.d/vnfilter
+sudo HOST_INSTALL=1 ./install.sh
 sudo chmod 0440 /etc/sudoers.d/vnfilter
 ```
 
@@ -93,6 +98,68 @@ The addon is using the redesigned in OpenNebula 5.10 VN_MAD and HOOK systems to 
 The ARP filtering is implemented using _ebtables_, the rules are following the ARP spoofing filters implemented in libvirt.
 
 Once enabled it is enough to live-migrate a VM for the new rules to be applied on the VM interfaces on the host.
+
+## Host-local ARP guard
+
+`vnm/arp_guard.rb` maintains a native nftables table in the bridge prerouting
+hook. It examines only broadcast ARP requests arriving on the configured
+physical ingress interface. Requests for IPv4 addresses assigned to live
+`one-*` taps on the configured bridge remain unrestricted. ARP replies,
+non-broadcast requests, non-ARP traffic, and packets entering VM taps do not
+match the guard.
+
+The reconciler reads the destination addresses from each live tap's
+`one-*-o-arp4` ebtables chain. It ignores stale chains and rebuilds the union on
+every run, so an address shared by multiple local taps remains present until
+the last owner disappears. The VNM activation and cleanup scripts and the
+alias hotplug hook reconcile after successful firewall mutations. A systemd
+timer may also run the synchronized `/var/tmp/one/vnm/arp_guard.rb` file.
+
+Configuration is read from `/etc/one/vnfilter-arp-guard.conf`:
+
+```ini
+mode=disabled
+ingress_interface=bond0.1
+bridge=br0
+table_name=one_arp_guard
+temporary_targets=
+```
+
+Supported modes are:
+
+* `disabled` keeps the dedicated table free of a guard verdict. This is the
+  default, including when the configuration file is absent.
+* `observe` counts requests that enforcement would drop but allows them.
+* `enforce` counts and drops those requests.
+
+`one_arp_guard` is a reserved table identity rather than a renameable value.
+The configuration key is retained so an unexpected or stale value fails open
+instead of silently selecting another table. `temporary_targets` is an
+optional comma-separated list of canonical IPv4
+addresses for narrowly scoped gateway or VIP exceptions. Keys, interface and
+table names, modes, and addresses are strictly validated before nft input is
+built.
+
+All invocations serialize through one host lock. A root-owned constrained
+helper validates the structured request, refuses to overwrite a pre-existing
+unowned table, and is the only command granted nft privileges. The desired set
+and mode are validated and replaced in one nft transaction. A missing live-tap chain,
+malformed address, command failure, or rejected nft transaction causes a
+fail-open transaction that removes the guard verdict; the reconciler never
+loads a partial target set. Errors are logged to syslog.
+
+The dedicated table does not replace or alter OpenNebula's per-tap iptables,
+ipset, or ebtables rules. To roll back, set `mode=disabled` and run the
+reconciler. If that cannot run, first confirm the configured table belongs to
+this addon, then delete only that `bridge` table. Never flush the global
+nftables ruleset or compatibility tables.
+
+Before `uninstall_vnfilter.sh step2` or `all`, set every host to `disabled`,
+apply the Ansible role so it performs a final reconciliation and stops the
+timer, and verify that the table has no guard verdict. The live uninstaller
+requires `--arp-guard-disabled` as an explicit acknowledgement; it then removes
+the synchronized reconciler with the other addon remotes. Do not use the flag
+as a substitute for host verification.
 
 
 ## Improvements

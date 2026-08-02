@@ -4,10 +4,11 @@ set -euo pipefail
 STEP="all"
 DEST_ROOT=""
 NO_SYNC="${SKIP_HOSTS_SYNC:-}"
+ARP_GUARD_DISABLED=0
 
 usage()
 {
-    echo "Usage: $0 [step1|step2|all] [--dest-root DIR] [--no-sync]"
+    echo "Usage: $0 [step1|step2|all] [--dest-root DIR] [--no-sync] [--arp-guard-disabled]"
 }
 
 if [[ $# -gt 0 && "$1" != --* ]]; then
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --no-sync) NO_SYNC=1 ;;
+        --arp-guard-disabled) ARP_GUARD_DISABLED=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -40,6 +42,13 @@ else
     [[ $EUID -eq 0 ]] || { echo "Live uninstall must run as root" >&2; exit 1; }
 fi
 REMOTES="$ONE_VAR/remotes"
+
+if [[ $STAGING -eq 0 && ( "$STEP" == step2 || "$STEP" == all ) &&
+      $ARP_GUARD_DISABLED -ne 1 ]]; then
+    echo "Refusing step2 until Ansible has reconciled every host in disabled mode." >&2
+    echo "Re-run with --arp-guard-disabled only after verifying no guard verdict remains." >&2
+    exit 1
+fi
 
 remove_owned()
 {
@@ -62,6 +71,7 @@ if [[ "$STEP" == step2 || "$STEP" == all ]]; then
     remove_owned "$REMOTES/vnm/fw/clean.d/vnfilter_clean"
     remove_owned "$REMOTES/vnm/vnfilter_post"
     remove_owned "$REMOTES/vnm/vnfilter_clean"
+    remove_owned "$REMOTES/vnm/arp_guard.rb"
     remove_owned "$REMOTES/vnm/vnfilter.rb"
     remove_owned "$REMOTES/hooks/alias_ip/vnfilter.rb"
 fi
@@ -75,4 +85,3 @@ if [[ "$STEP" == step1 ]]; then
 else
     echo "Vnfilter uninstall $STEP complete"
 fi
-

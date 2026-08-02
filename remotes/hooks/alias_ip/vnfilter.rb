@@ -60,6 +60,7 @@ require 'nokogiri'
 require 'open3'
 require 'shellwords'
 require 'syslog/logger'
+require_relative '../../vnm/arp_guard'
 
 ###############################################################################
 # Helpers
@@ -143,21 +144,26 @@ def run(cmds)
     if !status.success?
         log_error("PID[#{status.pid}] #{stderr}")
     end
+    status.success?
 end
 
 def toggle_ebtables_filter(vm)
+    success = true
     if !vm[:a][:ip].nil? and !vm[:a][:ip].empty?
         action = vm[:action]=='add'? '-A' : '-D'
         ['i', 'o'].each do |d|
             rule = d=='o'? '--arp-ip-dst' : '--arp-ip-src'
             chain = "#{vm[:nicdev]}-#{d}-arp4"
-            run(['sudo', 'ebtables', '--concurrent', '-t', 'nat', action,
-                 chain, '-p', 'ARP', rule, vm[:a][:ip], '-j', 'RETURN'])
+            result = run(['sudo', 'ebtables', '--concurrent', '-t', 'nat', action,
+                          chain, '-p', 'ARP', rule, vm[:a][:ip], '-j', 'RETURN'])
+            success = result && success
         end
     end
+    success
 end
 
 def toggle_ipset_filter(vm)
+    success = true
     ['IP', 'IP6', 'IP6_GLOBAL'].each do |e|
         key = e.downcase.to_sym
         if !vm[:a][key].nil? and !vm[:a][key].empty?
@@ -167,13 +173,16 @@ def toggle_ipset_filter(vm)
                 if !vm[:a][:ipset_prefix_length].nil? && \
                     !vm[:a][:ipset_prefix_length].empty? && \
                     key == :ip6
-            run(['sudo', 'ipset', '-exist', vm[:action], chain, ipv6net])
+            result = run(['sudo', 'ipset', '-exist', vm[:action], chain, ipv6net])
+            success = result && success
             if e == 'IP6_GLOBAL' and !vm[:a][:ip6_link].nil?
                 link = vm[:a][:ip6_link]
-                run(['sudo', 'ipset', '-exist', vm[:action], chain, link])
+                result = run(['sudo', 'ipset', '-exist', vm[:action], chain, link])
+                success = result && success
             end
         end
     end
+    success
 end
 
 
@@ -193,14 +202,21 @@ filters = Hash.new
 filters[:filter_ip_spoofing] = method(:toggle_ipset_filter)
 filters[:filter_mac_spoofing] = method(:toggle_ebtables_filter)
 
+mutations_ok = true
 filters.each do |key, method|
-    if !vm[:n][key].nil?
-        if vm[:n][key] == 'YES'
-            method.(vm)
-        end
-    end
+    next unless vm[:n][key] == 'YES'
+
+    result = method.(vm)
+    mutations_ok = result && mutations_ok
+end
+
+if mutations_ok
+    VnfilterArpGuard.reconcile(logger: @slog)
+else
+    log_error('Alias mutation failed; forcing the ARP guard open')
+    VnfilterArpGuard.fail_open(logger: @slog)
 end
 
 log('vnfilter hook END')
 
-exit 0
+exit(mutations_ok ? 0 : 1)
