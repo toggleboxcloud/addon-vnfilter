@@ -94,6 +94,20 @@ class SequencedEbtablesRunner < FakeRunner
     end
 end
 
+class FakeClock
+    def initialize
+        @now = 0.0
+    end
+
+    def call
+        @now
+    end
+
+    def advance(seconds)
+        @now += seconds
+    end
+end
+
 class FakeNftRunner
     attr_accessor :table_exists
     attr_reader :submissions
@@ -218,14 +232,15 @@ class ArpGuardTest
             runner,
             missing_chain_retries: 1,
             retry_interval: 2,
-            sleeper: ->(seconds) { sleeps << seconds }
+            sleeper: ->(seconds) { sleeps << seconds },
+            clock: -> { 0.0 }
         ).reconcile
 
         assert result
         assert_equal [2], sleeps
         assert_equal ['disabled', 'enforce'], guard_payloads(runner).map { |payload| payload['mode'] }
         assert @logger.messages.any? do |level, message|
-            level == :warn && message.include?('retrying for up to 2 seconds')
+            level == :warn && message.include?('retrying until 2-second deadline')
         end
         refute @logger.messages.any? { |level, _message| level == :error }
     end
@@ -240,7 +255,8 @@ class ArpGuardTest
             runner,
             missing_chain_retries: 2,
             retry_interval: 2,
-            sleeper: ->(seconds) { sleeps << seconds }
+            sleeper: ->(seconds) { sleeps << seconds },
+            clock: -> { 0.0 }
         ).reconcile
 
         refute result
@@ -249,6 +265,71 @@ class ArpGuardTest
         assert @logger.messages.any? do |level, message|
             level == :error && message.include?('missing expected')
         end
+    end
+
+    def test_retry_sleep_does_not_block_lifecycle_reconciliation
+        write_config('enforce')
+        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        runner = SequencedEbtablesRunner.new(
+            ip_output: IP_LINKS,
+            ebtables_outputs: [incomplete, EBTABLES, EBTABLES]
+        )
+        sleep_started = Queue.new
+        release_sleep = Queue.new
+        timer = reconciler(
+            runner,
+            missing_chain_retries: 1,
+            retry_interval: 2,
+            sleeper: lambda do |_seconds|
+                sleep_started << true
+                release_sleep.pop
+            end,
+            clock: -> { 0.0 }
+        )
+
+        timer_thread = Thread.new { timer.reconcile }
+        sleep_started.pop
+        lifecycle_thread = Thread.new { reconciler(runner).reconcile }
+
+        assert lifecycle_thread.join(2), 'lifecycle reconciliation blocked behind retry sleep'
+        assert lifecycle_thread.value
+
+        release_sleep << true
+        assert timer_thread.value
+    ensure
+        release_sleep << true if timer_thread&.alive?
+        timer_thread&.join
+        lifecycle_thread&.join
+    end
+
+    def test_retry_deadline_includes_completed_discovery_time
+        write_config('enforce')
+        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        clock = FakeClock.new
+        ebtables_calls = 0
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: incomplete) do |command|
+            next unless command == ['sudo', '-n', '/usr/sbin/ebtables-save']
+
+            ebtables_calls += 1
+            clock.advance(14)
+            nil
+        end
+        sleeps = []
+
+        result = reconciler(
+            runner,
+            missing_chain_retries: 15,
+            retry_interval: 2,
+            sleeper: lambda do |seconds|
+                sleeps << seconds
+                clock.advance(seconds)
+            end,
+            clock: clock.method(:call)
+        ).reconcile
+
+        refute result
+        assert_equal 2, ebtables_calls
+        assert_equal [2], sleeps
     end
 
     def test_malformed_ebtables_address_fails_open
