@@ -1,5 +1,6 @@
 # kind	source	destination	mode-or-link-target
 file	remotes/hooks/alias_ip/vnfilter.rb	/var/lib/one/remotes/hooks/alias_ip/vnfilter.rb	0755
+file	remotes/vnm/arp_guard.rb	/var/lib/one/remotes/vnm/arp_guard.rb	0755
 file	remotes/vnm/vnfilter.rb	/var/lib/one/remotes/vnm/vnfilter.rb	0644
 file	remotes/vnm/vnfilter_post	/var/lib/one/remotes/vnm/vnfilter_post	0755
 file	remotes/vnm/vnfilter_clean	/var/lib/one/remotes/vnm/vnfilter_clean	0755
