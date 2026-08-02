@@ -419,6 +419,13 @@ class ArpGuardTest
         assert_includes hook, 'exit(mutations_ok ? 0 : 1)'
     end
 
+    def test_parent_mac_spoofing_check_accepts_already_uppercase_yes
+        driver = File.read(File.expand_path('../remotes/vnm/vnfilter.rb', __dir__))
+
+        assert_includes driver, "parent_mac_spoofing.upcase != 'YES'"
+        refute_includes driver, 'parent_mac_spoofing.upcase!'
+    end
+
     def test_installer_preserves_ebtables_and_uses_constrained_helper
         installer = File.read(File.expand_path('../install.sh', __dir__))
 
