@@ -114,6 +114,9 @@ every run, so an address shared by multiple local taps remains present until
 the last owner disappears. The VNM activation and cleanup scripts and the
 alias hotplug hook reconcile after successful firewall mutations. A systemd
 timer may also run the synchronized `/var/tmp/one/vnm/arp_guard.rb` file.
+If the configured bridge is absent, the host is considered empty only when no
+OpenNebula taps exist. A missing bridge while any `one-*` tap exists is a
+readiness failure and forces fail-open.
 
 Configuration is read from `/etc/one/vnfilter-arp-guard.conf`:
 

@@ -158,14 +158,26 @@ module VnfilterArpGuard
         end
 
         def live_taps(bridge)
-            output = @runner.capture('/usr/sbin/ip', '-o', 'link', 'show', 'master', bridge)
-
-            output.each_line.filter_map do |line|
-                match = line.match(/\A\d+: ([^:]+):/)
+            output = @runner.capture('/usr/sbin/ip', '-o', 'link', 'show')
+            links = output.each_line.map do |line|
+                match = line.chomp.match(/\A\d+: ([^:]+): (.*)\z/)
                 raise ReadinessError, "cannot parse ip link output: #{line.strip}" unless match
 
                 interface = match[1].split('@', 2).first
-                interface if interface.match?(TAP_PATTERN)
+                master = match[2].match(/(?:\A|\s)master ([^\s]+)(?:\s|\z)/)&.captures&.first
+                [interface, master]
+            end
+
+            if links.none? { |interface, _master| interface == bridge }
+                if links.any? { |interface, _master| interface.match?(TAP_PATTERN) }
+                    raise ReadinessError, "missing bridge #{bridge} while VM taps exist"
+                end
+
+                return []
+            end
+
+            links.filter_map do |interface, master|
+                interface if interface.match?(TAP_PATTERN) && master == bridge
             end.uniq.sort
         end
 

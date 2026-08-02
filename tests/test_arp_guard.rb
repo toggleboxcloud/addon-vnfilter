@@ -57,7 +57,7 @@ class FakeRunner
         raise error if error
 
         case command
-        when ['/usr/sbin/ip', '-o', 'link', 'show', 'master', 'br0']
+        when ['/usr/sbin/ip', '-o', 'link', 'show']
             track_active { @ip_output }
         when ['sudo', '-n', '/usr/sbin/ebtables-save']
             @ebtables_output
@@ -102,9 +102,15 @@ end
 class ArpGuardTest
     include Assertions
     IP_LINKS = <<~OUTPUT.freeze
+        3: br0: <BROADCAST,MULTICAST,UP> mtu 1500 state UP
         10: one-12-0@if9: <BROADCAST> mtu 1500 master br0 state UP
         11: one-13-1: <BROADCAST> mtu 1500 master br0 state UP
         12: vnet-unrelated: <BROADCAST> mtu 1500 master br0 state UP
+    OUTPUT
+    EMPTY_HOST_LINKS = <<~OUTPUT.freeze
+        1: lo: <LOOPBACK,UP> mtu 65536 state UNKNOWN
+        6: bond0: <BROADCAST,MULTICAST,MASTER,UP> mtu 1500 state UP
+        7: bond0.301@bond0: <BROADCAST,MULTICAST,UP> mtu 1500 state UP
     OUTPUT
 
     EBTABLES = <<~OUTPUT.freeze
@@ -218,15 +224,28 @@ class ArpGuardTest
         assert_equal 'disabled', guard_payloads(runner).last['mode']
     end
 
-    def test_observe_mode_counts_without_a_drop_verdict
+    def test_observe_mode_accepts_empty_host_without_bridge
         write_config('observe')
-        runner = FakeRunner.new(ip_output: '', ebtables_output: "*nat\nCOMMIT\n")
+        runner = FakeRunner.new(ip_output: EMPTY_HOST_LINKS, ebtables_output: "*nat\nCOMMIT\n")
 
         assert reconciler(runner).reconcile
 
         payload = guard_payloads(runner).last
         assert_equal 'observe', payload['mode']
         assert_equal [], payload['targets']
+    end
+
+    def test_missing_bridge_with_live_vm_taps_fails_open
+        write_config('observe')
+        links = "10: one-12-0@if9: <BROADCAST> mtu 1500 master br0 state UP\n"
+        runner = FakeRunner.new(ip_output: links, ebtables_output: "*nat\nCOMMIT\n")
+
+        refute reconciler(runner).reconcile
+
+        assert_equal 'disabled', guard_payloads(runner).last['mode']
+        assert @logger.messages.any? do |level, message|
+            level == :error && message.include?('missing bridge br0 while VM taps exist')
+        end
     end
 
     def test_enforce_mode_counts_and_drops
