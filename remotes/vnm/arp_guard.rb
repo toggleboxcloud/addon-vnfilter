@@ -10,10 +10,14 @@ require 'syslog/logger'
 module VnfilterArpGuard
     CONFIG_PATH = '/etc/one/vnfilter-arp-guard.conf'.freeze
     LOCK_PATH = '/var/tmp/one/.vnfilter-arp-guard.lock'.freeze
+    DEGRADED_STATE_PATH = '/var/tmp/one/.vnfilter-arp-guard-degraded.json'.freeze
     NFT_HELPER = '/usr/local/sbin/vnfilter-arp-guard-nft'.freeze
     TABLE_NAME = 'one_arp_guard'.freeze
     MISSING_CHAIN_RETRIES = 15
     MISSING_CHAIN_RETRY_INTERVAL = 2
+    HEALTHY = true
+    DEGRADED = true
+    FAILED = false
 
     DEFAULTS = {
         'mode' => 'disabled',
@@ -31,7 +35,16 @@ module VnfilterArpGuard
     class ConfigError < Error; end
     class CommandError < Error; end
     class ReadinessError < Error; end
-    class MissingChainError < ReadinessError; end
+    class StateError < Error; end
+    class LockBusyError < Error; end
+    class MissingChainError < ReadinessError
+        attr_reader :chain
+
+        def initialize(chain)
+            @chain = chain
+            super("missing expected ebtables nat chain #{chain}")
+        end
+    end
 
     Config = Struct.new(
         :mode,
@@ -62,6 +75,8 @@ module VnfilterArpGuard
             logger: Syslog::Logger.new('vnfilter_arp_guard'),
             missing_chain_retries: 0,
             retry_interval: MISSING_CHAIN_RETRY_INTERVAL,
+            state_path: DEGRADED_STATE_PATH,
+            wall_clock: -> { Time.now.to_i },
             sleeper: Kernel.method(:sleep),
             clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
         )
@@ -71,11 +86,13 @@ module VnfilterArpGuard
             @logger = logger
             @missing_chain_retries = missing_chain_retries
             @retry_interval = retry_interval
+            @state_path = state_path
+            @wall_clock = wall_clock
             @sleeper = sleeper
             @clock = clock
         end
 
-        def reconcile
+        def reconcile(nonblocking: false)
             retries_remaining = @missing_chain_retries
             retry_window = @missing_chain_retries * @retry_interval
             retry_deadline = @clock.call + retry_window
@@ -83,11 +100,12 @@ module VnfilterArpGuard
             loop do
                 missing_chain = nil
                 fail_open_succeeded = true
-                result = with_lock do
+                result = with_lock(nonblocking: nonblocking) do
                     reconcile_once
+                    clear_degraded_state
                 rescue MissingChainError => e
                     missing_chain = e
-                    fail_open_succeeded = fail_open
+                    fail_open_succeeded = fail_open && record_degraded_state(e)
                     false
                 rescue StandardError => e
                     @logger.error("ARP guard reconciliation failed: #{e.message}")
@@ -95,13 +113,13 @@ module VnfilterArpGuard
                     false
                 end
 
-                return true if result
-                return false unless missing_chain && fail_open_succeeded
+                return HEALTHY if result
+                return FAILED unless missing_chain && fail_open_succeeded
 
                 remaining_time = retry_deadline - @clock.call
                 if retries_remaining.zero? || remaining_time <= 0
-                    @logger.error("ARP guard reconciliation failed: #{missing_chain.message}")
-                    return false
+                    @logger.warn("ARP guard remains fail-open: #{missing_chain.message}")
+                    return DEGRADED
                 end
 
                 if retries_remaining == @missing_chain_retries
@@ -114,14 +132,19 @@ module VnfilterArpGuard
                 retries_remaining -= 1
                 @sleeper.call([@retry_interval, remaining_time].min)
                 if @clock.call >= retry_deadline
-                    @logger.error("ARP guard reconciliation failed: #{missing_chain.message}")
-                    return false
+                    @logger.warn("ARP guard remains fail-open: #{missing_chain.message}")
+                    return DEGRADED
                 end
             end
+        rescue LockBusyError
+            @logger.info('ARP guard reconciliation skipped because another reconciliation holds the lock')
+            return HEALTHY if nonblocking
+
+            FAILED
         rescue StandardError => e
             @logger.error("ARP guard reconciliation failed: #{e.message}")
             with_lock { fail_open }
-            false
+            FAILED
         end
 
         def reconcile_once
@@ -154,6 +177,58 @@ module VnfilterArpGuard
 
         def force_fail_open
             with_lock { fail_open }
+        end
+
+        def enabled?
+            load_config.mode != 'disabled'
+        end
+
+        def record_degraded_state(missing_chain)
+            now = Integer(@wall_clock.call)
+            previous = read_degraded_state
+            payload = JSON.generate(
+                'version' => 1,
+                'degraded_since' => previous ? previous.fetch('degraded_since') : now,
+                'last_seen' => now,
+                'missing_chains' => [missing_chain.chain]
+            )
+            temporary_path = "#{@state_path}.#{Process.pid}.tmp"
+            File.open(temporary_path, File::WRONLY | File::CREAT | File::EXCL, 0o644) do |state|
+                state.write(payload)
+                state.flush
+                state.fsync
+            end
+            File.rename(temporary_path, @state_path)
+            true
+        rescue StandardError => e
+            @logger.error("ARP guard degraded state update failed: #{e.message}")
+            false
+        ensure
+            File.delete(temporary_path) if defined?(temporary_path) && File.exist?(temporary_path)
+        end
+
+        def clear_degraded_state
+            File.delete(@state_path) if File.exist?(@state_path)
+            true
+        rescue SystemCallError => e
+            @logger.error("ARP guard degraded state cleanup failed: #{e.message}")
+            false
+        end
+
+        def read_degraded_state
+            return nil unless File.exist?(@state_path)
+
+            state = JSON.parse(File.read(@state_path))
+            unless state.is_a?(Hash) && state['version'] == 1 &&
+                   state['degraded_since'].is_a?(Integer) && state['degraded_since'].positive?
+                raise StateError, 'invalid existing degraded state'
+            end
+
+            state
+        rescue JSON::ParserError => e
+            raise StateError, "cannot parse existing degraded state: #{e.message}"
+        rescue SystemCallError => e
+            raise StateError, "cannot read existing degraded state: #{e.message}"
         end
 
         def load_config
@@ -291,7 +366,7 @@ module VnfilterArpGuard
 
             taps.flat_map do |tap|
                 chain = "#{tap}-o-arp4"
-                raise MissingChainError, "missing expected ebtables nat chain #{chain}" unless declarations[chain]
+                raise MissingChainError.new(chain) unless declarations[chain]
 
                 rules[chain]
             end.uniq.sort
@@ -326,10 +401,13 @@ module VnfilterArpGuard
             @runner.capture('sudo', '-n', NFT_HELPER, '--apply', stdin_data: payload_json)
         end
 
-        def with_lock
+        def with_lock(nonblocking: false)
             FileUtils.mkdir_p(File.dirname(@lock_path))
             File.open(@lock_path, File::RDWR | File::CREAT, 0o644) do |lock|
-                lock.flock(File::LOCK_EX)
+                mode = File::LOCK_EX
+                mode |= File::LOCK_NB if nonblocking
+                raise LockBusyError, 'ARP guard lock is busy' unless lock.flock(mode)
+
                 yield
             end
         rescue SystemCallError => e
@@ -340,12 +418,23 @@ module VnfilterArpGuard
 
     def self.reconcile(
         logger: Syslog::Logger.new('vnfilter_arp_guard'),
-        missing_chain_retries: 0
+        missing_chain_retries: 0,
+        nonblocking: false
     )
         Reconciler.new(
             logger: logger,
             missing_chain_retries: missing_chain_retries
-        ).reconcile
+        ).reconcile(nonblocking: nonblocking)
+    end
+
+    def self.reconcile_after_activation(logger: Syslog::Logger.new('vnfilter_arp_guard'))
+        probe = Reconciler.new(logger: logger)
+        return :disabled unless probe.enabled?
+
+        reconcile(logger: logger, nonblocking: true)
+    rescue StandardError => e
+        logger.warn("ARP guard post-activation reconciliation skipped: #{e.message}")
+        FAILED
     end
 
     def self.fail_open(logger: Syslog::Logger.new('vnfilter_arp_guard'))
