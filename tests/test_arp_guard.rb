@@ -158,6 +158,7 @@ class ArpGuardTest
         @directory = Dir.mktmpdir('arp-guard-test')
         @config_path = File.join(@directory, 'arp-guard.conf')
         @lock_path = File.join(@directory, 'arp-guard.lock')
+        @state_path = File.join(@directory, 'arp-guard-degraded.json')
         @logger = FakeLogger.new
     end
 
@@ -173,6 +174,7 @@ class ArpGuardTest
         VnfilterArpGuard::Reconciler.new(
             config_path: @config_path,
             lock_path: @lock_path,
+            state_path: @state_path,
             runner: runner,
             logger: @logger,
             **options
@@ -206,17 +208,18 @@ class ArpGuardTest
         refute_includes payload['targets'], '198.51.100.99'
     end
 
-    def test_missing_live_tap_chain_fails_open
+    def test_missing_live_tap_chain_fails_open_without_failing_the_timer
         write_config('enforce')
         ebtables = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: ebtables)
 
-        refute reconciler(runner).reconcile
+        assert reconciler(runner).reconcile
 
         payloads = guard_payloads(runner)
         assert_equal 1, payloads.length
         assert_equal 'disabled', payloads.first['mode']
-        assert @logger.messages.any? { |level, message| level == :error && message.include?('missing expected') }
+        assert File.exist?(@state_path)
+        assert @logger.messages.any? { |level, message| level == :warn && message.include?('remains fail-open') }
     end
 
     def test_missing_live_tap_chain_is_retried_during_standalone_grace_period
@@ -245,7 +248,7 @@ class ArpGuardTest
         refute @logger.messages.any? { |level, _message| level == :error }
     end
 
-    def test_persistent_missing_live_tap_chain_fails_after_grace_period
+    def test_persistent_missing_live_tap_chain_stays_degraded_after_grace_period
         write_config('enforce')
         incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: incomplete)
@@ -259,12 +262,10 @@ class ArpGuardTest
             clock: -> { 0.0 }
         ).reconcile
 
-        refute result
+        assert result
         assert_equal [2, 2], sleeps
         assert guard_payloads(runner).all? { |payload| payload['mode'] == 'disabled' }
-        assert @logger.messages.any? do |level, message|
-            level == :error && message.include?('missing expected')
-        end
+        assert @logger.messages.any? { |level, message| level == :warn && message.include?('remains fail-open') }
     end
 
     def test_retry_sleep_does_not_block_lifecycle_reconciliation
@@ -289,6 +290,7 @@ class ArpGuardTest
 
         timer_thread = Thread.new { timer.reconcile }
         sleep_started.pop
+        assert File.exist?(@state_path), 'missing-chain state was not recorded before the retry lock released'
         lifecycle_thread = Thread.new { reconciler(runner).reconcile }
 
         assert lifecycle_thread.join(2), 'lifecycle reconciliation blocked behind retry sleep'
@@ -300,6 +302,28 @@ class ArpGuardTest
         release_sleep << true if timer_thread&.alive?
         timer_thread&.join
         lifecycle_thread&.join
+    end
+
+    def test_nonblocking_reconciliation_skips_when_another_run_holds_the_lock
+        write_config('enforce')
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: EBTABLES)
+        lock_ready = Queue.new
+        release_lock = Queue.new
+        holder = Thread.new do
+            File.open(@lock_path, File::RDWR | File::CREAT, 0o644) do |lock|
+                lock.flock(File::LOCK_EX)
+                lock_ready << true
+                release_lock.pop
+            end
+        end
+        lock_ready.pop
+
+        assert reconciler(runner).reconcile(nonblocking: true)
+        assert_equal [], runner.calls
+        assert @logger.messages.any? { |level, message| level == :info && message.include?('skipped') }
+    ensure
+        release_lock << true if holder&.alive?
+        holder&.join
     end
 
     def test_retry_deadline_includes_completed_discovery_time
@@ -327,7 +351,7 @@ class ArpGuardTest
             clock: clock.method(:call)
         ).reconcile
 
-        refute result
+        assert result
         assert_equal 2, ebtables_calls
         assert_equal [2], sleeps
     end
@@ -463,7 +487,7 @@ class ArpGuardTest
         OUTPUT
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: ebtables)
 
-        refute reconciler(runner).reconcile
+        assert reconciler(runner).reconcile
         assert_equal 'disabled', guard_payloads(runner).last['mode']
     end
 
@@ -473,6 +497,15 @@ class ArpGuardTest
 
         assert reconciler(runner).reconcile
         assert_equal 'observe', guard_payloads(runner).last['mode']
+    end
+
+    def test_successful_reconciliation_clears_degraded_state
+        write_config('enforce')
+        File.write(@state_path, JSON.generate('version' => 1, 'degraded_since' => 100))
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: EBTABLES)
+
+        assert reconciler(runner).reconcile
+        refute File.exist?(@state_path)
     end
 
     def test_nft_helper_refuses_an_unowned_existing_table
@@ -575,6 +608,13 @@ class ArpGuardTest
         assert_includes installer, 'vnfilter-arp-guard-nft --check'
         assert_includes installer, 'vnfilter-arp-guard-nft --apply'
         refute_includes installer, '/usr/sbin/nft -f -'
+    end
+
+    def test_post_hook_reconciles_the_guard_without_failing_the_lifecycle_hook
+        hook = File.read(File.expand_path('../remotes/vnm/vnfilter_post', __dir__))
+
+        assert_includes hook, 'VnfilterArpGuard.reconcile_after_activation'
+        assert_includes hook, 'ARP guard post-activation reconciliation skipped'
     end
 
     def test_live_uninstall_requires_disabled_acknowledgement_and_removes_remote

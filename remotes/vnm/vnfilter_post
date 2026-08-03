@@ -27,9 +27,17 @@ template64   = STDIN.read
 deploy_id    = nil
 xpath_filter = nil
 
+def reconcile_arp_guard
+    require 'arp_guard'
+    VnfilterArpGuard.reconcile_after_activation
+rescue Exception => e
+    OpenNebula::DriverLogger.log_error("ARP guard post-activation reconciliation skipped: #{e.message}")
+end
+
 begin
     vn_filter = VnFilter.from_base64(template64, xpath_filter, deploy_id)
     vn_filter.activate
+    reconcile_arp_guard
 rescue Exception => e
     OpenNebula::DriverLogger.log_error(e)
     exit 1
