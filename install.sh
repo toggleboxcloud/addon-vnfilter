@@ -104,7 +104,7 @@ as_oneadmin()
 # Single source of truth, shared with the composition generator. Keeping a
 # second copy here let install, --check and lock generation drift apart.
 REPO_ROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-MANIFEST="$REPO_ROOT/manifests/cloud-7.4.0.tsv"
+MANIFEST="$REPO_ROOT/manifests/cloud-7.4.1.tsv"
 [[ -f "$MANIFEST" ]] || { echo "missing $MANIFEST" >&2; exit 2; }
 
 # Manifest destinations are written as literal /var/lib/one/remotes/... paths,
