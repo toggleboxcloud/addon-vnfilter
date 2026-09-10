@@ -16,26 +16,22 @@ spoof filtering on attach, detach and hotplug, and ARP filtering when
   `opennebula-one` site branch.
 - `deployed/<ref>` — older naming for the same role as `site/*`. Being retired.
 
-`site/cloud-7.4.0` is the newest composition branch; `site/cloud-7.2.1` is the
-one production currently installs from. `deployed/cloud-7.0.1` is retired naming
-for the same role, not a newer composition.
+The newest composition has the highest `site/cloud-<version>` branch. Production
+currently installs from `site/cloud-7.2.1`. `deployed/cloud-7.0.1` is retired
+naming for the same role, not a newer composition.
 
 Confirm which commit a composition pins rather than assuming — the pin lives in
 `components.tsv` on the `opennebula-one` branch that carries a component lock,
 and nowhere else:
 
-| Composition | Component lock lives on |
-| --- | --- |
-| 7.4.0 | `opennebula-one` `site/cloud-7.4.0` — the site branch and the registry branch are the same branch here. |
-| 7.2.1 | `opennebula-one` `origin/site/cloud-7.2.1r` only. The deployed `site/cloud-7.2.1` carries no lock at all — its composed installer resolves this repository from `VNFILTER_REPO`. |
+Registry-carrying compositions keep the lock on the matching `opennebula-one`
+`site/cloud-<version>` branch. The deployed `site/cloud-7.2.1` branch carries no
+lock; its historical lock is on `origin/site/cloud-7.2.1r`, and its composed
+installer resolves this repository from `VNFILTER_REPO`.
 
-This file and its `CLAUDE.md` symlink are committed on `master`,
-`site/cloud-7.2.1` and `site/cloud-7.4.0`, and are meant to stay byte-identical
-across all three. The text above is deliberately version-generic for that reason:
-change it everywhere or nowhere. Rewriting version numbers per branch is what once
-put a reference to a nonexistent `site/cloud-7.4.0r` branch in this file, along
-with the claim that 7.4.0 has no component lock — it has one, and its installer
-refuses the `*_REPO` overrides outright.
+This file and its `CLAUDE.md` symlink are committed on `master` and maintained
+`site/*` branches and must stay byte-identical. Keep this text version-generic;
+change it everywhere or nowhere.
 
 ## Layout
 
