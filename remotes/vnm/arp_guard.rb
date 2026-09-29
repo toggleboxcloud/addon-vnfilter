@@ -311,6 +311,8 @@ module VnfilterArpGuard
         end
 
         def discover_targets(taps)
+            return [] if taps.empty?
+
             output = @runner.capture('sudo', '-n', '/usr/sbin/ebtables-save')
             declarations = {}
             rules = Hash.new { |hash, key| hash[key] = [] }
