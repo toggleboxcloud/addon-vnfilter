@@ -81,6 +81,8 @@ class VnFilter < VNMMAD::VNMDriver
         return false unless command.match?(/ -[AN] /)
         return false if stderr.nil? || stderr.empty?
 
+        return true if command.match?(/ -N /) && stderr.include?('Chain already exists')
+
         stderr.include?('RULE_DELETE failed') &&
             stderr.include?('No such file or directory')
     end
@@ -89,7 +91,8 @@ class VnFilter < VNMMAD::VNMDriver
         return false unless command.match?(/ -[FX] /)
         return false if stderr.nil? || stderr.empty?
 
-        stderr.include?('CHAIN_USER_DEL failed (Device or resource busy)')
+        stderr.include?('CHAIN_USER_DEL failed (Device or resource busy)') ||
+            stderr.include?('CHAIN_DEL failed (Device or resource busy)')
     end
 
     def log_ebtables_chain_snapshot(chain, ebtables_nat = nil)

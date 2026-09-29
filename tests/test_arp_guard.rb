@@ -390,15 +390,18 @@ class ArpGuardTest
         assert_equal 'disabled', guard_payloads(runner).last['mode']
     end
 
-    def test_observe_mode_accepts_empty_host_without_bridge
+    def test_observe_mode_accepts_empty_host_without_bridge_or_ebtables_nat_table
         write_config('observe')
-        runner = FakeRunner.new(ip_output: EMPTY_HOST_LINKS, ebtables_output: "*nat\nCOMMIT\n")
+        runner = FakeRunner.new(ip_output: EMPTY_HOST_LINKS, ebtables_output: "*filter\nCOMMIT\n")
 
         assert reconciler(runner).reconcile
 
         payload = guard_payloads(runner).last
         assert_equal 'observe', payload['mode']
         assert_equal [], payload['targets']
+        refute runner.calls.any? { |command, _input|
+            command == ['sudo', '-n', '/usr/sbin/ebtables-save']
+        }
     end
 
     def test_missing_bridge_with_live_vm_taps_fails_open
