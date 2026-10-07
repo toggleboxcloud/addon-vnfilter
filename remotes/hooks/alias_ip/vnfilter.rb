@@ -134,30 +134,108 @@ def vm_data()
     vm
 end
 
+# Capture argv directly: addresses and names must never become shell syntax.
+def capture(cmds)
+    stdout, stderr, status = Open3.capture3(*cmds)
+    log("(#{status.exitstatus}) #{Shellwords.join(cmds)}")
+    log_error("PID[#{status.pid}] #{stderr}") unless status.success?
+    [stdout, stderr, status.success?]
+end
+
 def run(cmds)
-    cmd = String.new
-    cmds.each do |c|
-        cmd.concat(" #{Shellwords.escape(c)}")
+    capture(cmds).last
+end
+
+# Share the VNM lifecycle driver's lock. Read/modify/read must serialize with
+# chain rebuilds and other alias hooks, not just individual ebtables commands.
+def with_vnfilter_lock(path = '/tmp/onevnm-vnfilter-lock')
+    File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|
+        lock.flock(File::LOCK_EX)
+        yield
     end
-    stdout, stderr, status = Open3.capture3(cmd)
-    log("(#{status.exitstatus}) #{cmd}")
-    if !status.success?
-        log_error("PID[#{status.pid}] #{stderr}")
+end
+
+# A failed read is not proof that a whitelist rule is absent. Only a complete
+# nat-table dump may be used to decide whether a mutation is necessary.
+def arp_rule_count(chain, rule, ip)
+    stdout, _, success = capture(['sudo', '-n', 'ebtables-save'])
+    return nil unless success
+
+    inventory = stdout.lines
+    starts = inventory.each_index.select { |index| inventory[index] == "*nat\n" }
+    unless starts.length == 1
+        log_error('Missing or duplicate ebtables nat table')
+        return nil
     end
-    status.success?
+
+    # nft ebtables-save ends each table with "# Completed on ...", not COMMIT.
+    # Stop at the first table boundary: a later table cannot complete this one.
+    lines = inventory.drop(starts.first + 1)
+    boundary = lines.index do |line|
+        line.start_with?('*', '# Completed on ') || line == "COMMIT\n"
+    end
+    unless boundary && (lines[boundary] == "COMMIT\n" ||
+                        lines[boundary].match?(/\A# Completed on .+\n\z/))
+        log_error('Incomplete ebtables nat inventory')
+        return nil
+    end
+
+    lines = lines.take(boundary)
+    return 0 unless lines.any? { |line| line.start_with?(":#{chain} ") }
+
+    wanted = ['-A', chain, '-p', 'ARP', rule, ip, '-j', 'RETURN']
+    lines.count do |line|
+        tokens = Shellwords.split(line)
+        # ebtables-save may render an exact IPv4 address with its /32 mask.
+        tokens[5] = tokens[5].delete_suffix('/32') if tokens.length == 8
+        tokens == wanted
+    end
+rescue ArgumentError => e
+    log_error("Invalid ebtables inventory: #{e.message}")
+    nil
+end
+
+def transient_ebtables_error?(stderr)
+    (stderr.include?('RULE_DELETE failed') &&
+     stderr.include?('No such file or directory')) ||
+        stderr.include?('Device or resource busy')
+end
+
+# Retry this rule only, and read back after each command. A backend can apply a
+# mutation and still report an error; replaying successful -A commands blindly
+# would duplicate rules. Deletion also removes duplicates left by older hooks.
+def reconcile_arp_rule(chain, rule, ip, add, max_attempts: 5)
+    max_attempts.times do |attempt|
+        count = arp_rule_count(chain, rule, ip)
+        return false if count.nil?
+        return true if add ? count > 0 : count == 0
+
+        action = add ? '-A' : '-D'
+        _, stderr, success = capture(
+            ['sudo', '-n', 'ebtables', '--concurrent', '-t', 'nat', action,
+             chain, '-p', 'ARP', rule, ip, '-j', 'RETURN']
+        )
+        return false unless success || transient_ebtables_error?(stderr)
+
+        count = arp_rule_count(chain, rule, ip)
+        return false if count.nil?
+        return true if add ? count > 0 : count == 0
+
+        sleep(0.2 * (attempt + 1)) if attempt + 1 < max_attempts
+    end
+    log_error("ARP whitelist did not converge for #{chain} #{ip}")
+    false
 end
 
 def toggle_ebtables_filter(vm)
+    return true if vm[:a][:ip].nil? || vm[:a][:ip].empty?
+
     success = true
-    if !vm[:a][:ip].nil? and !vm[:a][:ip].empty?
-        action = vm[:action]=='add'? '-A' : '-D'
-        ['i', 'o'].each do |d|
-            rule = d=='o'? '--arp-ip-dst' : '--arp-ip-src'
-            chain = "#{vm[:nicdev]}-#{d}-arp4"
-            result = run(['sudo', 'ebtables', '--concurrent', '-t', 'nat', action,
-                          chain, '-p', 'ARP', rule, vm[:a][:ip], '-j', 'RETURN'])
-            success = result && success
-        end
+    ['i', 'o'].each do |direction|
+        rule = direction == 'o' ? '--arp-ip-dst' : '--arp-ip-src'
+        chain = "#{vm[:nicdev]}-#{direction}-arp4"
+        result = reconcile_arp_rule(chain, rule, vm[:a][:ip], vm[:action] == 'add')
+        success = result && success
     end
     success
 end
@@ -173,11 +251,11 @@ def toggle_ipset_filter(vm)
                 if !vm[:a][:ipset_prefix_length].nil? && \
                     !vm[:a][:ipset_prefix_length].empty? && \
                     key == :ip6
-            result = run(['sudo', 'ipset', '-exist', vm[:action], chain, ipv6net])
+            result = run(['sudo', '-n', 'ipset', '-exist', vm[:action], chain, ipv6net])
             success = result && success
             if e == 'IP6_GLOBAL' and !vm[:a][:ip6_link].nil?
                 link = vm[:a][:ip6_link]
-                result = run(['sudo', 'ipset', '-exist', vm[:action], chain, link])
+                result = run(['sudo', '-n', 'ipset', '-exist', vm[:action], chain, link])
                 success = result && success
             end
         end
@@ -190,33 +268,45 @@ end
 # Main
 #
 
-log("vnfilter hook BEGIN")
+if $PROGRAM_NAME == __FILE__
+    log("vnfilter hook BEGIN")
 
-vm_xml_raw = Base64.decode64(STDIN.read)
-vm_xml = Nokogiri::XML(vm_xml_raw)
-VM_XML = vm_xml
+    mutations_ok = false
+    begin
+        vm_xml_raw = Base64.decode64(STDIN.read)
+        vm_xml = Nokogiri::XML(vm_xml_raw)
+        VM_XML = vm_xml
 
-vm = vm_data()
+        vm = vm_data()
 
-filters = Hash.new
-filters[:filter_ip_spoofing] = method(:toggle_ipset_filter)
-filters[:filter_mac_spoofing] = method(:toggle_ebtables_filter)
+        with_vnfilter_lock do
+            filters = Hash.new
+            filters[:filter_ip_spoofing] = method(:toggle_ipset_filter)
+            filters[:filter_mac_spoofing] = method(:toggle_ebtables_filter)
 
-mutations_ok = true
-filters.each do |key, method|
-    next unless vm[:n][key] == 'YES'
+            mutations_ok = true
+            filters.each do |key, method|
+                next unless vm[:n][key] == 'YES'
 
-    result = method.(vm)
-    mutations_ok = result && mutations_ok
+                result = method.(vm)
+                mutations_ok = result && mutations_ok
+            end
+
+            if mutations_ok
+                mutations_ok = VnfilterArpGuard.reconcile(logger: @slog)
+            else
+                log_error('Alias mutation failed; forcing the ARP guard open')
+                VnfilterArpGuard.fail_open(logger: @slog)
+            end
+        end
+
+    rescue StandardError => e
+        mutations_ok = false
+        log_error("Alias hook failed: #{e.class}: #{e.message}")
+        VnfilterArpGuard.fail_open(logger: @slog)
+    end
+
+    log('vnfilter hook END')
+
+    exit(mutations_ok ? 0 : 1)
 end
-
-if mutations_ok
-    VnfilterArpGuard.reconcile(logger: @slog)
-else
-    log_error('Alias mutation failed; forcing the ARP guard open')
-    VnfilterArpGuard.fail_open(logger: @slog)
-end
-
-log('vnfilter hook END')
-
-exit(mutations_ok ? 0 : 1)
