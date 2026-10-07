@@ -8,3 +8,4 @@ link	-	/var/lib/one/remotes/vnm/802.1Q/post.d/vnfilter_post	../../vnfilter_post
 link	-	/var/lib/one/remotes/vnm/802.1Q/clean.d/vnfilter_clean	../../vnfilter_clean
 link	-	/var/lib/one/remotes/vnm/fw/post.d/vnfilter_post	../../vnfilter_post
 link	-	/var/lib/one/remotes/vnm/fw/clean.d/vnfilter_clean	../../vnfilter_clean
+file	remotes/vnm/vnfilter_firewall_safety.rb	/var/lib/one/remotes/vnm/vnfilter_firewall_safety.rb	0644

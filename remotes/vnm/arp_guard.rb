@@ -6,6 +6,7 @@ require 'json'
 require 'open3'
 require 'shellwords'
 require 'syslog/logger'
+require_relative 'vnfilter_firewall_safety'
 
 module VnfilterArpGuard
     CONFIG_PATH = '/etc/one/vnfilter-arp-guard.conf'.freeze
@@ -314,57 +315,18 @@ module VnfilterArpGuard
             return [] if taps.empty?
 
             output = @runner.capture('sudo', '-n', '/usr/sbin/ebtables-save')
-            declarations = {}
+            inventory = AddonFirewallSafety::Inventory.new(output, table: 'nat', ebtables: true)
+            declarations = inventory.chains
             rules = Hash.new { |hash, key| hash[key] = [] }
-            current_table = nil
-            saw_nat = false
-
-            output.each_line.with_index(1) do |line, line_number|
-                stripped = line.strip
-                next if stripped.empty? || stripped.start_with?('#')
-
-                if stripped.start_with?('*')
-                    current_table = stripped.delete_prefix('*')
-                    unless current_table.match?(/\A[a-zA-Z0-9_]+\z/)
-                        raise ReadinessError, "invalid ebtables table on line #{line_number}"
-                    end
-                    if current_table == 'nat'
-                        raise ReadinessError, 'duplicate ebtables nat table' if saw_nat
-
-                        saw_nat = true
-                    end
-                    next
-                end
-                if stripped == 'COMMIT'
-                    raise ReadinessError, "ebtables COMMIT without table on line #{line_number}" unless current_table
-
-                    current_table = nil
-                    next
-                end
-                next unless current_table == 'nat'
-
-                tokens = Shellwords.split(stripped)
-                if tokens.first&.start_with?(':')
-                    declarations[tokens.first.delete_prefix(':')] = true
-                    next
-                end
-                next unless tokens.first == '-A'
-
+            inventory.rules.each do |tokens|
                 chain = tokens[1]
                 next unless taps.any? { |tap| chain == "#{tap}-o-arp4" }
-
                 address_index = tokens.index('--arp-ip-dst')
                 next unless address_index
-
                 address = tokens[address_index + 1]
-                raise ReadinessError, "missing ARP target on ebtables line #{line_number}" unless address
-
-                rules[chain] << parse_ipv4(address, "ebtables line #{line_number}")
-            rescue ArgumentError => e
-                raise ReadinessError, "cannot parse ebtables line #{line_number}: #{e.message}"
+                raise ReadinessError, 'missing ARP target' unless address
+                rules[chain] << parse_ipv4(address.delete_suffix('/32'), 'ebtables inventory')
             end
-
-            raise ReadinessError, 'missing ebtables nat table' unless saw_nat
 
             taps.flat_map do |tap|
                 chain = "#{tap}-o-arp4"
@@ -372,6 +334,8 @@ module VnfilterArpGuard
 
                 rules[chain]
             end.uniq.sort
+        rescue AddonFirewallSafety::Error => e
+            raise ReadinessError, e.message
         end
 
         def parse_ipv4(address, context)
@@ -405,14 +369,10 @@ module VnfilterArpGuard
 
         def with_lock(nonblocking: false)
             FileUtils.mkdir_p(File.dirname(@lock_path))
-            File.open(@lock_path, File::RDWR | File::CREAT, 0o644) do |lock|
-                mode = File::LOCK_EX
-                mode |= File::LOCK_NB if nonblocking
-                raise LockBusyError, 'ARP guard lock is busy' unless lock.flock(mode)
-
-                yield
-            end
-        rescue SystemCallError => e
+            AddonFirewallSafety.with_lock(@lock_path, nonblocking: nonblocking) { yield }
+        rescue AddonFirewallSafety::LockBusy => e
+            raise LockBusyError, e.message
+        rescue SystemCallError, AddonFirewallSafety::Error => e
             @logger.error("ARP guard lock failed: #{e.message}")
             false
         end

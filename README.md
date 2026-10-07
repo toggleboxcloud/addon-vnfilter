@@ -188,3 +188,35 @@ The uninstall procedure is in two steps as follow:
   * delete the clean.d files on the hosts `rm /var/tmp/one/vnm/*/clean.d/vnfilter*`
   * delete the rest of the vnfilter files on the frontend(s) `rm /var/lib/one/remotes/vnm/vnfilter* /var/lib/one/remotes/hooks/alias_ip/vnfilter*` 
   * delete the rest of the vnfilter files on the hosts `rm /var/tmp/one/vnm/vnfilter* /var/tmp/one/hooks/alias_ip/vnfilter* /etc/sudoers.d/vnfilter`
+
+### Firewall safety on 7.4.1
+
+Lifecycle operations and the alias hook share `/tmp/onevnm-vnfilter-lock`.
+The ARP guard takes its own lock after the lifecycle lock. Lock files must be
+regular, owned by the executing user, and free of symlinks, hardlinks, and group
+or world write permissions. Every lifecycle return or exception releases its
+lock.
+
+Firewall reads must succeed and contain complete tables. The parser supports
+both legacy `COMMIT` and nft ebtables completion markers, and normalizes exact
+IPv4 `/32` addresses. Cleanup selects exact owned chains and rules; an unrelated
+chain referencing an owned chain causes cleanup to fail rather than deleting
+the unrelated rule. Mutations use argv, noninteractive sudo, backend locking,
+and readback. Transient failures allow five attempts with increasing 0.2-second
+backoff; successful operations are never blindly replayed. ARP guard failures
+retain fail-open handling and are reported to the lifecycle caller.
+
+`remotes/vnm/vnfilter_firewall_safety.rb` must remain byte-identical to SMTP's
+`smtp_filter_firewall_safety.rb`. Check both 7.4.1 worktrees with:
+
+```sh
+bash tests/check_firewall_safety_parity.sh ../addon-smtp_filter-cloud-7.4.1
+ruby -I /usr/share/one/gems/gems/minitest-5.27.0/lib tests/test_firewall_safety.rb
+ruby -I /usr/share/one/gems/gems/minitest-5.27.0/lib tests/test_alias_hook_retries.rb
+ruby -I /usr/share/one/gems/gems/minitest-5.27.0/lib tests/test_vnfilter_ebtables_errors.rb
+sudo -n ruby tests/test_arp_guard.rb
+sudo -n bash tests/test_manifest_confinement.sh
+```
+
+The Ruby tests simulate firewall operations. ARP guard tests need root for their
+root-owned configuration fixtures. Manifest tests use isolated staging trees.

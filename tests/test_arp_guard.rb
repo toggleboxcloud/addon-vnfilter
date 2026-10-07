@@ -210,7 +210,7 @@ class ArpGuardTest
 
     def test_missing_live_tap_chain_fails_open_without_failing_the_timer
         write_config('enforce')
-        ebtables = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        ebtables = EBTABLES.lines.reject { |line| line.include?('one-13-1-o-arp4') }.join
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: ebtables)
 
         assert reconciler(runner).reconcile
@@ -224,7 +224,7 @@ class ArpGuardTest
 
     def test_missing_live_tap_chain_is_retried_during_standalone_grace_period
         write_config('enforce')
-        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        incomplete = EBTABLES.lines.reject { |line| line.include?('one-13-1-o-arp4') }.join
         runner = SequencedEbtablesRunner.new(
             ip_output: IP_LINKS,
             ebtables_outputs: [incomplete, EBTABLES]
@@ -250,7 +250,7 @@ class ArpGuardTest
 
     def test_persistent_missing_live_tap_chain_stays_degraded_after_grace_period
         write_config('enforce')
-        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        incomplete = EBTABLES.lines.reject { |line| line.include?('one-13-1-o-arp4') }.join
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: incomplete)
         sleeps = []
 
@@ -270,7 +270,7 @@ class ArpGuardTest
 
     def test_retry_sleep_does_not_block_lifecycle_reconciliation
         write_config('enforce')
-        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        incomplete = EBTABLES.lines.reject { |line| line.include?('one-13-1-o-arp4') }.join
         runner = SequencedEbtablesRunner.new(
             ip_output: IP_LINKS,
             ebtables_outputs: [incomplete, EBTABLES, EBTABLES]
@@ -328,7 +328,7 @@ class ArpGuardTest
 
     def test_retry_deadline_includes_completed_discovery_time
         write_config('enforce')
-        incomplete = EBTABLES.lines.reject { |line| line.include?(':one-13-1-o-arp4') }.join
+        incomplete = EBTABLES.lines.reject { |line| line.include?('one-13-1-o-arp4') }.join
         clock = FakeClock.new
         ebtables_calls = 0
         runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: incomplete) do |command|
@@ -496,10 +496,19 @@ class ArpGuardTest
 
     def test_ebtables_save_format_without_commit_is_supported
         write_config('observe')
-        runner = FakeRunner.new(ip_output: '', ebtables_output: "*nat\n")
+        dump = EBTABLES.gsub(/192\.0\.2\.(\d+)/, '192.0.2.\1/32').sub("COMMIT\n", "# Completed on fixture\n")
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: dump)
 
         assert reconciler(runner).reconcile
         assert_equal 'observe', guard_payloads(runner).last['mode']
+        assert_equal ['192.0.2.10', '192.0.2.11', '192.0.2.12'], guard_payloads(runner).last['targets']
+    end
+
+    def test_truncated_inventory_fails_open_without_enforcing_partial_targets
+        write_config('enforce')
+        runner = FakeRunner.new(ip_output: IP_LINKS, ebtables_output: EBTABLES.sub("COMMIT\n", ''))
+        refute reconciler(runner).reconcile
+        assert_equal ['disabled'], guard_payloads(runner).map { |payload| payload['mode'] }
     end
 
     def test_successful_reconciliation_clears_degraded_state

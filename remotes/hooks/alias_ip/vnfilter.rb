@@ -149,10 +149,7 @@ end
 # Share the VNM lifecycle driver's lock. Read/modify/read must serialize with
 # chain rebuilds and other alias hooks, not just individual ebtables commands.
 def with_vnfilter_lock(path = '/tmp/onevnm-vnfilter-lock')
-    File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |lock|
-        lock.flock(File::LOCK_EX)
-        yield
-    end
+    AddonFirewallSafety.with_lock(path) { yield }
 end
 
 # A failed read is not proof that a whitelist rule is absent. Only a complete
@@ -161,44 +158,15 @@ def arp_rule_count(chain, rule, ip)
     stdout, _, success = capture(['sudo', '-n', 'ebtables-save'])
     return nil unless success
 
-    inventory = stdout.lines
-    starts = inventory.each_index.select { |index| inventory[index] == "*nat\n" }
-    unless starts.length == 1
-        log_error('Missing or duplicate ebtables nat table')
-        return nil
-    end
-
-    # nft ebtables-save ends each table with "# Completed on ...", not COMMIT.
-    # Stop at the first table boundary: a later table cannot complete this one.
-    lines = inventory.drop(starts.first + 1)
-    boundary = lines.index do |line|
-        line.start_with?('*', '# Completed on ') || line == "COMMIT\n"
-    end
-    unless boundary && (lines[boundary] == "COMMIT\n" ||
-                        lines[boundary].match?(/\A# Completed on .+\n\z/))
-        log_error('Incomplete ebtables nat inventory')
-        return nil
-    end
-
-    lines = lines.take(boundary)
-    return 0 unless lines.any? { |line| line.start_with?(":#{chain} ") }
-
-    wanted = ['-A', chain, '-p', 'ARP', rule, ip, '-j', 'RETURN']
-    lines.count do |line|
-        tokens = Shellwords.split(line)
-        # ebtables-save may render an exact IPv4 address with its /32 mask.
-        tokens[5] = tokens[5].delete_suffix('/32') if tokens.length == 8
-        tokens == wanted
-    end
-rescue ArgumentError => e
+    inventory = AddonFirewallSafety::Inventory.new(stdout, table: 'nat', ebtables: true)
+    inventory.matching(chain, ['-p', 'ARP', rule, ip, '-j', 'RETURN']).length
+rescue AddonFirewallSafety::Error => e
     log_error("Invalid ebtables inventory: #{e.message}")
     nil
 end
 
 def transient_ebtables_error?(stderr)
-    (stderr.include?('RULE_DELETE failed') &&
-     stderr.include?('No such file or directory')) ||
-        stderr.include?('Device or resource busy')
+    AddonFirewallSafety.transient?(stderr)
 end
 
 # Retry this rule only, and read back after each command. A backend can apply a
@@ -215,7 +183,8 @@ def reconcile_arp_rule(chain, rule, ip, add, max_attempts: 5)
             ['sudo', '-n', 'ebtables', '--concurrent', '-t', 'nat', action,
              chain, '-p', 'ARP', rule, ip, '-j', 'RETURN']
         )
-        return false unless success || transient_ebtables_error?(stderr)
+        return false unless success || transient_ebtables_error?(stderr) ||
+            (!add && AddonFirewallSafety.missing?(stderr))
 
         count = arp_rule_count(chain, rule, ip)
         return false if count.nil?

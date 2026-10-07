@@ -20,9 +20,32 @@
 require 'vnmmad'
 require 'syslog/logger'
 require_relative 'arp_guard'
+require_relative 'vnfilter_firewall_safety'
 
 # IP filter for aliases
 class VnFilter < VNMMAD::VNMDriver
+    include AddonFirewallSafety::LifecycleLock
+
+    def tap_name(vm_id, nic_id)
+        unless vm_id.to_s.match?(/\A\d+\z/) && nic_id.to_s.match?(/\A\d+\z/)
+            raise AddonFirewallSafety::Error, 'invalid VM or NIC identifier'
+        end
+        "one-#{vm_id}-#{nic_id}"
+    end
+
+    def firewall_lock_path
+        '/tmp/onevnm-vnfilter-lock'
+    end
+
+    def iptables_inventory(ipv6)
+        tool = ipv6 ? 'ip6tables' : 'iptables'
+        prefix = Shellwords.split(VNMMAD::VNMNetwork::COMMANDS.fetch(tool.to_sym))
+        AddonFirewallSafety::Backend.new(tool: tool, table: 'filter', prefix: prefix).inventory
+    end
+
+    def ebtables_backend
+        @ebtables_backend ||= AddonFirewallSafety::Backend.new(tool: 'ebtables', table: 'nat', sleeper: method(:sleep))
+    end
 
     class EbtablesCommandError < StandardError
 
@@ -35,9 +58,6 @@ class VnFilter < VNMMAD::VNMDriver
             super("Command Error: #{command} #{args}\n#{stderr}")
         end
 
-    end
-
-    class EbtablesCleanupBusyError < EbtablesCommandError
     end
 
     DRIVER = 'vnfilter'
@@ -53,10 +73,7 @@ class VnFilter < VNMMAD::VNMDriver
     end
 
     def reconcile_arp_guard
-        VnfilterArpGuard.reconcile(logger: @slog)
-    rescue StandardError => e
-        @slog.error "ARP guard invocation failed: #{e.message}"
-        false
+        raise AddonFirewallSafety::Error, 'ARP guard reconciliation failed' unless VnfilterArpGuard.reconcile(logger: @slog)
     end
 
     def ebtables_mutation_command
@@ -71,90 +88,25 @@ class VnFilter < VNMMAD::VNMDriver
         end
     end
 
-    def read_ebtables_nat
-        commands =  VNMMAD::VNMNetwork::Commands.new
-        commands.add "sudo -n", "ebtables-save"
-        commands.run!
-    end
-
-    def retryable_ebtables_activation_error?(command, stderr)
-        return false unless command.match?(/ -[AN] /)
-        return false if stderr.nil? || stderr.empty?
-
-        return true if command.match?(/ -N /) && stderr.include?('Chain already exists')
-
-        stderr.include?('RULE_DELETE failed') &&
-            stderr.include?('No such file or directory')
-    end
-
-    def busy_ebtables_cleanup_error?(command, stderr)
-        return false unless command.match?(/ -[FX] /)
-        return false if stderr.nil? || stderr.empty?
-
-        stderr.include?('CHAIN_USER_DEL failed (Device or resource busy)') ||
-            stderr.include?('CHAIN_DEL failed (Device or resource busy)')
-    end
-
-    def log_ebtables_chain_snapshot(chain, ebtables_nat = nil)
-        ebtables_nat ||= read_ebtables_nat
-
-        snapshot = ebtables_nat.each_line.select { |line| line.include?(chain) }
-
-        if snapshot.empty?
-            @slog.warn "[snapshot] no ebtables nat entries found for #{chain}"
-            return
-        end
-
-        snapshot.each { |line| @slog.warn "[snapshot] #{line.strip}" }
-    end
-
     def run_ebtables_mutation!(args, context)
         @slog.info "[#{context}] ebtables #{args}"
-        stdout, stderr, status =
-            VNMMAD::VNMNetwork::Command.run(ebtables_mutation_command, args)
-
-        return stdout if status.success?
-
-        @slog.warn "[#{context}] ebtables failed: #{args}"
-        @slog.warn stderr unless stderr.nil? || stderr.empty?
-
-        raise EbtablesCommandError.new(ebtables_mutation_command, args, stderr)
+        tokens = Shellwords.split(args)
+        raise AddonFirewallSafety::Error, 'expected nat mutation' unless tokens.shift(2) == ['-t', 'nat']
+        ebtables_backend.reconcile(tokens)
+    rescue AddonFirewallSafety::Error => e
+        raise EbtablesCommandError.new(ebtables_mutation_command, args, e.message)
     end
 
-    def execute_ebtables_commands!(chain, commands, retry_on_rule_delete: false, max_retries: 2)
-        attempts = 0
-
-        loop do
-            last_successful = nil
-
-            begin
-            commands.each do |command|
-                run_ebtables_mutation!(command, "activate #{chain}")
-                last_successful = command
-            end
-                return
-            rescue EbtablesCommandError => e
-                @slog.warn "[activate #{chain}] last successful ebtables command: #{last_successful}" \
-                    unless last_successful.nil?
-
-                if retry_on_rule_delete &&
-                   attempts < max_retries &&
-                   retryable_ebtables_activation_error?(e.args, e.stderr)
-                    attempts += 1
-                    @slog.warn "[activate #{chain}] retrying after transient ebtables failure "\
-                        "(attempt #{attempts} of #{max_retries}): #{e.args}"
-                    log_ebtables_chain_snapshot(chain)
-                    deactivate_ebtables(chain)
-                    sleep attempts
-                    next
-                end
-
-                raise
-            end
-        end
+    def execute_ebtables_commands!(chain, commands)
+        ebtables_backend.inventory(refresh: true)
+        commands.each { |command| run_ebtables_mutation!(command, "activate #{chain}") }
     end
 
     def build_mac_spoofing_ebtables_commands(chain, chain_i, chain_o, nic, nicdata)
+        unless chain.match?(/\Aone-\d+-\d+\z/) && chain_i == "#{chain}-i" && chain_o == "#{chain}-o"
+            raise AddonFirewallSafety::Error, 'invalid vnfilter chain names'
+        end
+        mac = Shellwords.escape(nic[:mac].to_s)
         commands = []
 
         add_ebtables_mutation(commands, "-t nat -N #{chain_i}-arp4 -P DROP")
@@ -162,6 +114,7 @@ class VnFilter < VNMMAD::VNMDriver
 
         if !nicdata[:ip4].nil? and !nicdata[:ip4].empty?
             nicdata[:ip4].each do |ip|
+                ip = Shellwords.escape(ip)
                 @slog.info "ARP whitelist #{ip} (#{chain})"
                 add_ebtables_mutation(commands, "-t nat -A #{chain_i}-arp4 -p ARP "\
                     "--arp-ip-src #{ip} -j RETURN")
@@ -172,9 +125,9 @@ class VnFilter < VNMMAD::VNMDriver
 
         add_ebtables_mutation(commands, "-t nat -N #{chain_i}-arp -P DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i}-arp -p ARP "\
-            "-s ! #{nic[:mac]} -j DROP")
+            "-s ! #{mac} -j DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i}-arp -p ARP "\
-            "--arp-mac-src ! #{nic[:mac]} -j DROP")
+            "--arp-mac-src ! #{mac} -j DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i}-arp -p ARP "\
             "-j #{chain_i}-arp4")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i}-arp -p ARP "\
@@ -183,9 +136,9 @@ class VnFilter < VNMMAD::VNMDriver
             "--arp-op Reply -j ACCEPT")
         add_ebtables_mutation(commands, "-t nat -N #{chain_i}-rarp -P DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i}-rarp -p 0x8035 "\
-            "-s #{nic[:mac]} -d Broadcast --arp-op Request_Reverse "\
+            "-s #{mac} -d Broadcast --arp-op Request_Reverse "\
             "--arp-ip-src 0.0.0.0 --arp-ip-dst 0.0.0.0 "\
-            "--arp-mac-src #{nic[:mac]} --arp-mac-dst #{nic[:mac]} "\
+            "--arp-mac-src #{mac} --arp-mac-dst #{mac} "\
             "-j ACCEPT")
         add_ebtables_mutation(commands, "-t nat -N #{chain_i} -P ACCEPT")
         add_ebtables_mutation(commands, "-t nat -A #{chain_i} -p IPv4 "\
@@ -201,7 +154,7 @@ class VnFilter < VNMMAD::VNMDriver
 
         add_ebtables_mutation(commands, "-t nat -N #{chain_o}-arp -P DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-arp -p ARP "\
-            "--arp-op Reply --arp-mac-dst ! #{nic[:mac]} -j DROP")
+            "--arp-op Reply --arp-mac-dst ! #{mac} -j DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-arp -p ARP "\
             "-j #{chain_o}-arp4")
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-arp -p ARP "\
@@ -212,7 +165,7 @@ class VnFilter < VNMMAD::VNMDriver
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-rarp -p 0x8035 "\
             "-d Broadcast --arp-op Request_Reverse "\
             "--arp-ip-src 0.0.0.0 --arp-ip-dst 0.0.0.0 "\
-            "--arp-mac-src #{nic[:mac]} --arp-mac-dst #{nic[:mac]} "\
+            "--arp-mac-src #{mac} --arp-mac-dst #{mac} "\
             "-j ACCEPT")
         add_ebtables_mutation(commands, "-t nat -N #{chain_o} -P ACCEPT")
         add_ebtables_mutation(commands, "-t nat -A #{chain_o} -p IPv4 "\
@@ -229,68 +182,17 @@ class VnFilter < VNMMAD::VNMDriver
         commands
     end
 
-    def ignorable_ebtables_cleanup_error?(command, stderr)
-        return false unless command.match?(/ -[DFX] /)
-        return false if stderr.nil? || stderr.empty?
-
-        missing_target = stderr.include?('No such file or directory') ||
-                         stderr.include?('does not exist') ||
-                         stderr.include?('No chain/target/match by that name')
-
-        missing_target
-    end
-
     def run_ebtables_cleanup!(args)
-        @slog.info "[run] ebtables #{args}"
-        stdout, stderr, status =
-            VNMMAD::VNMNetwork::Command.run(ebtables_mutation_command, args)
-
-        return stdout if status.success?
-
-        if ignorable_ebtables_cleanup_error?(args, stderr)
-            @slog.warn "Ignoring missing ebtables cleanup target: #{args}"
-            @slog.warn stderr
-
-            return stdout
-        end
-
-        if busy_ebtables_cleanup_error?(args, stderr)
-            raise EbtablesCleanupBusyError.new(ebtables_mutation_command, args, stderr)
-        end
-
-        raise EbtablesCommandError.new(ebtables_mutation_command, args, stderr)
+        run_ebtables_mutation!(args, 'cleanup')
     end
 
     def append_ebtables(chain, ipv4)
-        @slog.info "activate_ebtables(#{chain},#{ipv4})"
-        dirs = { "i" => "src", "o" => "dst" }
-        ret = false
-        commands = []
-        ebtables_nat = read_ebtables_nat
-        if !ebtables_nat.nil?
-            ebtables_nat.split("\n").each do |rule|
-                if rule.match(/-A #{chain}-([io]{1})-arp4/)
-                    dir = $+
-                    rule_e = rule.split
-                    ip = rule_e[5]
-                    if ipv4 == rule_e[5]
-                        @slog.info "[match] #{rule} // #{ip} #{dir}"
-                        dirs.delete(dir)
-                        ret = true
-                    end
-                end
-            end
+        commands = %w[i o].map do |direction|
+            address_option = direction == 'i' ? '--arp-ip-src' : '--arp-ip-dst'
+            Shellwords.join(['-t', 'nat', '-A', "#{chain}-#{direction}-arp4", '-p', 'ARP', address_option, ipv4, '-j', 'RETURN'])
         end
-        if dirs.any?
-            dirs.each do |k,v|
-                @slog.info "whitelist arp-ip-#{v} #{ipv4} (#{k})"
-                add_ebtables_mutation(commands, "-t nat -A #{chain}-#{k}-arp4 -p ARP "\
-                    "--arp-ip-#{v} #{ipv4} -j RETURN")
-                ret = true
-            end
-            execute_ebtables_commands!(chain, commands)
-        end
-        return ret
+        execute_ebtables_commands!(chain, commands)
+        true
     end
 
     def activate
@@ -306,22 +208,19 @@ class VnFilter < VNMMAD::VNMDriver
             if !parent_mac_spoofing.nil? && !parent_mac_spoofing.empty?
                 if parent_mac_spoofing.upcase != 'YES'
                     @slog.warn "activate() VM #{vm_id} Warning: parent NIC_ID #{parent_id} has FILTER_MAC_SPOOFING=#{parent_mac_spoofing}! //SKIP"
-                    unlock
                     return
                 end
             else
                 @slog.warn "activate() VM #{vm_id} Warning: no FILTER_MAC_SPOOFING enabled on parent NIC_ID #{parent_id}! //SKIP"
-                unlock
                 return
             end
             ipv4 = vm['TEMPLATE/NIC_ALIAS[ATTACH="YES"]/IP']
             if ipv4
                 @slog.info "activate() VM #{vm_id} parent_id:#{parent_id} BEGIN"
-                chain = "one-#{vm_id}-#{parent_id}"
+                chain = tap_name(vm_id, parent_id)
                 if append_ebtables(chain, ipv4)
                     @slog.info "activate() VM #{vm_id} parent_id:#{parent_id} END"
                     reconcile_arp_guard
-                    unlock
                     return
                 end
             end
@@ -381,23 +280,20 @@ class VnFilter < VNMMAD::VNMDriver
             @slog.info "VM #{vm_id} nic_id #{nic_id} attach_nic_id:#{attach_nic_id}"
             OpenNebula::DriverLogger.log_info "VM #{vm_id} nic_id #{nic_id} #{vn_mad} attach_nic_id #{attach_nic_id}"
             next if attach_nic_id and attach_nic_id != nic_id
-            chain = "one-#{vm_id}-#{nic_id}"
+            chain = tap_name(vm_id, nic_id)
             chain_i = "#{chain}-i"
             chain_o = "#{chain}-o"
 
-            commands =  VNMMAD::VNMNetwork::Commands.new
+            commands =  AddonFirewallSafety::Commands.new
 
             if nic[:filter_ip_spoofing] == "YES"
                 @slog.info "VM #{vm_id} NIC #{nic_id} FILTER_IP_SPOOFING"
-                commands.add :iptables, "-S #{chain_o}"
-                begin
-                    iptables_s = commands.run!
-                rescue
-                    @slog.warn "Can't process chain #{chain_o} IPv4"
-                    next
-                end
-                iptables_s.each_line { |c| @slog.info "[iptables -S] #{c}" }
-                if iptables_s !~ /#{chain}-ip-spoofing/
+                ipv4_state = iptables_inventory(false)
+                ipv6_state = iptables_inventory(true)
+                raise AddonFirewallSafety::Error, "missing IPv6 chain #{chain_o}" unless ipv6_state.chains.key?(chain_o)
+                raise AddonFirewallSafety::Error, "missing IPv4 chain #{chain_o}" unless ipv4_state.chains.key?(chain_o)
+                spoof_rule = ['-m', 'set', '!', '--match-set', "#{chain}-ip-spoofing", 'src', '-j', 'DROP']
+                if ipv4_state.matching(chain_o, spoof_rule).empty?
                     @slog.info "patching #{chain_o} to add #{chain}-ip-spoofing"
                     commands.add :ipset, "create -exist #{chain}-ip-spoofing hash:ip family inet"
                     commands.add :iptables, "-R #{chain_o} #{ipv4_offset} -m set ! --match-set #{chain}-ip-spoofing src -j DROP"
@@ -406,25 +302,18 @@ class VnFilter < VNMMAD::VNMDriver
                 if !nicdata[:ip4].nil? and !nicdata[:ip4].empty?
                     nicdata[:ip4].each do |ip|
                         @slog.info "ipset add #{chain}-ip-spoofing #{ip}"
-                        commands.add :ipset, "add -exist #{chain}-ip-spoofing #{ip}"
+                        commands.add :ipset, "add -exist #{chain}-ip-spoofing #{Shellwords.escape(ip)}"
                     end
-                    commands.run!
                 end
-                commands.add :ip6tables, "-S #{chain_o}"
-                begin
-                    ip6tables_s = commands.run!
-                rescue
-                    @slog.warn "Can't process chain #{chain_o} IPv6"
-                    next
-                end
+                commands.run! if commands.any?
                 if !nicdata[:ipset_prefix_length].nil? &&
                     !nicdata[:ipset_prefix_length].empty?
                     ipset_hash = "hash:net"
                 else
                     ipset_hash = "hash:ip"
                 end
-                ip6tables_s.each_line { |c| @slog.info "[ip6tables -S] #{c}" }
-                if ip6tables_s !~ /#{chain}-ip6-spoofing/
+                spoof_rule = ['-m', 'set', '!', '--match-set', "#{chain}-ip6-spoofing", 'src', '-j', 'DROP']
+                if ipv6_state.matching(chain_o, spoof_rule).empty?
                     @slog.debug "altering #{chain_o} to add #{chain}-ip6-spoofing"
                     commands.add :ipset, "create -exist #{chain}-ip6-spoofing #{ipset_hash} family inet6"
                     commands.add :ip6tables, "-R #{chain_o} #{ipv6_offset} -m set ! --match-set #{chain}-ip6-spoofing src -j DROP"
@@ -432,10 +321,10 @@ class VnFilter < VNMMAD::VNMDriver
                 if !nicdata[:ip6].nil? and !nicdata[:ip6].empty?
                     nicdata[:ip6].each do |ipv6|
                         @slog.info "ipset add #{chain}-ip6-spoofing #{ipv6}"
-                        commands.add :ipset, "add -exist #{chain}-ip6-spoofing #{ipv6}"
+                        commands.add :ipset, "add -exist #{chain}-ip6-spoofing #{Shellwords.escape(ipv6)}"
                     end
-                    commands.run!
                 end
+                commands.run! if commands.any?
             end
 
             if nic[:filter_mac_spoofing] == "YES"
@@ -449,16 +338,15 @@ class VnFilter < VNMMAD::VNMDriver
                     nicdata
                 )
 
-                execute_ebtables_commands!(
-                    chain,
-                    ebtables_commands,
-                    retry_on_rule_delete: true,
-                    max_retries: 4
-                )
+                execute_ebtables_commands!(chain, ebtables_commands)
             end
         end
         @slog.info "activate() VM #{vm_id} END"
         reconcile_arp_guard
+    rescue StandardError
+        VnfilterArpGuard.fail_open(logger: @slog)
+        raise
+    ensure
         unlock
     end
 
@@ -473,7 +361,7 @@ class VnFilter < VNMMAD::VNMDriver
         process do |nic|
             next if caller_mad != nic[:vn_mad]
             nic_id = nic[:nic_id]
-            chain = "one-#{vm_id}-#{nic_id}"
+            chain = tap_name(vm_id, nic_id)
             if nic[:attach]
                 @slog.info "VM #{vm_id} NIC #{nic_id} vn_mad=#{nic[:vn_mad]} parent=#{nic[:parent]} ip=#{nic[:ip]}"
                 attach = true
@@ -491,87 +379,55 @@ class VnFilter < VNMMAD::VNMDriver
         if !attach
             nics.each do |nic_id, nic|
                 @slog.info "VM #{vm_id} NIC #{nic_id} vn_mad=#{nic[:vn_mad]} down"
-                deactivate_ebtables("one-#{vm_id}-#{nic_id}")
+                deactivate_ebtables(tap_name(vm_id, nic_id))
             end
         end
         @slog.info "deactivate() VM #{vm_id} END"
         reconcile_arp_guard
+    rescue StandardError
+        VnfilterArpGuard.fail_open(logger: @slog)
+        raise
+    ensure
         unlock
     end
 
+    def owned_ebtables_chain?(name, tap)
+        name.match?(/\A#{Regexp.escape(tap)}-[io](?:-arp4|-arp|-rarp)?\z/)
+    end
+
     def collect_ebtables_cleanup_commands(chain, ebtables_nat, ipv4 = nil)
-        ebtables = Array.new
-        chains = Array.new
-
-        ebtables_nat.split("\n").each do |rule|
-            if ipv4
-                if rule.match(/-A #{chain}/)
-                    rule_e = rule.split
-                    @slog.info "[rule] #{rule}"
-                    if rule_e[5] == ipv4
-                        @slog.info "Delete #{rule}"
-                        ebtables.push("-t nat -D #{rule_e[1..-1].join(" ")}")
-                    end
-                end
-
-                next
-            end
-
-            if rule.match(/-j #{chain}/)
-                rule_e = rule.split
-                @slog.info "[rule] #{rule}"
-                if rule_e[2] == "-p"
-                    ebtables.push("-t nat -F #{rule_e[-1]}")
-                    ebtables.push("-t nat -X #{rule_e[-1]}")
-                    ebtables.unshift("-t nat -D #{rule_e[1..-1].join(" ")}")
-                else
-                    ebtables.push("-t nat -D #{rule_e[1..-1].join(" ")}")
-                    ebtables.push("-t nat -F #{rule_e[-1]}")
-                    ebtables.push("-t nat -X #{rule_e[-1]}")
-                end
-            end
-
-            if rule.match(/:#{chain}/)
-                rule_e = rule.split
-                current_chain = rule_e[0][1..-1]
-                @slog.info "[chain] #{current_chain}"
-                chains.push(current_chain)
+        state = ebtables_nat.is_a?(AddonFirewallSafety::Inventory) ? ebtables_nat :
+            AddonFirewallSafety::Inventory.new(ebtables_nat, table: 'nat', ebtables: true)
+        if ipv4
+            return state.rules.filter_map do |rule|
+                next unless ["#{chain}-i-arp4", "#{chain}-o-arp4"].include?(rule[1])
+                option = rule[1] == "#{chain}-i-arp4" ? '--arp-ip-src' : '--arp-ip-dst'
+                wanted = ['-p', 'ARP', option, ipv4, '-j', 'RETURN']
+                next unless AddonFirewallSafety.rule_key(rule.drop(2)) == AddonFirewallSafety.rule_key(wanted)
+                Shellwords.join(['-t', 'nat', '-D'] + rule.drop(1))
             end
         end
 
-        chains.each do |current_chain|
-            unless ebtables.include? "-t nat -X #{current_chain}"
-                ebtables.push("-t nat -F #{current_chain}")
-                ebtables.push("-t nat -X #{current_chain}")
-            end
+        owned = state.chains.keys.select { |name| owned_ebtables_chain?(name, chain) }
+        commands = state.rules.filter_map do |rule|
+            jump = rule.index('-j')
+            next unless jump && owned.include?(rule[jump + 1])
+            next if owned.include?(rule[1]) # flushing owned chains removes internal jumps
+            expected = case rule[1]
+                       when 'PREROUTING' then ['-i', chain, '-j', "#{chain}-i"]
+                       when 'POSTROUTING' then ['-o', chain, '-j', "#{chain}-o"]
+                       end
+            next unless expected && AddonFirewallSafety.rule_key(rule.drop(2)) == AddonFirewallSafety.rule_key(expected)
+            Shellwords.join(['-t', 'nat', '-D'] + rule.drop(1))
         end
-
-        ebtables
+        commands + owned.map { |name| Shellwords.join(['-t', 'nat', '-F', name]) } +
+            owned.map { |name| Shellwords.join(['-t', 'nat', '-X', name]) }
     end
 
     def deactivate_ebtables(chain, ipv4 = nil)
-        @slog.info "deactivate_ebtables(#{chain}, #{ipv4})"
-        attempts = 0
-
-        begin
-            ebtables_nat = read_ebtables_nat
-            return if ebtables_nat.nil? || ebtables_nat.empty?
-
-            ebtables = collect_ebtables_cleanup_commands(chain, ebtables_nat, ipv4)
-            return if ebtables.empty?
-
-            ebtables.each { |command| run_ebtables_cleanup!(command) }
-        rescue EbtablesCleanupBusyError => e
-            attempts += 1
-
-            if attempts <= 3
-                @slog.warn "Retrying busy ebtables cleanup for #{chain} (attempt #{attempts}): #{e.args}"
-                sleep 1
-                retry
-            end
-
-            raise
-        end
+        commands = collect_ebtables_cleanup_commands(chain, ebtables_backend.inventory(refresh: true), ipv4)
+        commands.each { |command| run_ebtables_cleanup!(command) }
+        remaining = collect_ebtables_cleanup_commands(chain, ebtables_backend.inventory, ipv4)
+        raise AddonFirewallSafety::Error, "ebtables cleanup incomplete for #{chain}" unless remaining.empty?
     end
-
 end

@@ -72,6 +72,7 @@ if [[ "$STEP" == step2 || "$STEP" == all ]]; then
     remove_owned "$REMOTES/vnm/vnfilter_post"
     remove_owned "$REMOTES/vnm/vnfilter_clean"
     remove_owned "$REMOTES/vnm/arp_guard.rb"
+    remove_owned "$REMOTES/vnm/vnfilter_firewall_safety.rb"
     remove_owned "$REMOTES/vnm/vnfilter.rb"
     remove_owned "$REMOTES/hooks/alias_ip/vnfilter.rb"
 fi
