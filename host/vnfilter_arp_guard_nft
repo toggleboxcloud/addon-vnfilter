@@ -138,6 +138,7 @@ module VnfilterArpGuardNft
                 add table bridge #{TABLE_NAME}
                 flush table bridge #{TABLE_NAME}
                 add set bridge #{TABLE_NAME} local_targets { type ipv4_addr; }
+                flush set bridge #{TABLE_NAME} local_targets
                 #{add_elements}#{chain}
             NFT
         end

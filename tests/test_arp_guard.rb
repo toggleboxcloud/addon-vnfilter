@@ -579,6 +579,27 @@ class ArpGuardTest
         assert_includes enforce, 'counter drop'
     end
 
+    def test_nft_helper_flushes_targets_before_repopulating_the_set
+        manager = nft_manager(FakeNftRunner.new)
+        base = {
+            'version' => 1,
+            'mode' => 'enforce',
+            'ingress_interface' => 'bond0.1'
+        }
+
+        [['192.0.2.9'], []].each do |targets|
+            payload = manager.parse_payload(JSON.generate(base.merge('targets' => targets)))
+            commands = manager.program(payload).lines.map(&:strip)
+            expected = [
+                'add set bridge one_arp_guard local_targets { type ipv4_addr; }',
+                'flush set bridge one_arp_guard local_targets'
+            ]
+            expected << "add element bridge one_arp_guard local_targets { #{targets.join(', ')} }" unless targets.empty?
+
+            assert_equal expected, commands.grep(/\A(?:add set|flush set|add element) /)
+        end
+    end
+
     def test_nft_helper_rejects_extra_fields_and_noncanonical_targets
         manager = nft_manager(FakeNftRunner.new)
         base = {
