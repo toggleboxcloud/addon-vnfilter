@@ -66,6 +66,17 @@ class VnfilterEbtablesErrorsTest < Minitest::Test
         assert_equal commands, @fake.mutations.length
     end
 
+    def test_first_activation_after_reboot_creates_rules_when_nat_table_is_absent
+        @fake.raw_inventory = "*filter\n:FORWARD ACCEPT\n# Completed on fixture\n"
+        @filter.deactivate_ebtables('one-42-1')
+        assert_empty @fake.mutations
+        @fake.failure = ->(_args) { @fake.raw_inventory = nil; nil }
+        seed
+        assert @fake.chains.key?('one-42-1-o-arp4')
+        assert @fake.rules.any? { |rule| rule[1] == 'POSTROUTING' && rule.include?('one-42-1-o') }
+        assert_equal build.length, @fake.mutations.length
+    end
+
     def test_busy_cleanup_retries_current_delete_without_replaying_flushes
         seed
         failures = 0

@@ -95,14 +95,16 @@ unless defined?(AddonFirewallSafety)
         class Inventory
             attr_reader :chains, :rules
 
-            def initialize(output, table:, ebtables: false)
+            def initialize(output, table:, ebtables: false, allow_missing: false)
                 @chains = {}
                 @rules = []
                 current = nil
                 seen = []
+                completed = false
                 output.each_line do |line|
                     text = line.strip
                     next if text.empty?
+                    completed = false
                     if text.start_with?('*')
                         raise Error, 'incomplete firewall table' if current
                         current = text.delete_prefix('*')
@@ -113,6 +115,7 @@ unless defined?(AddonFirewallSafety)
                         current = nil
                     elsif ebtables && text.match?(/\A# Completed on .+/)
                         current = nil
+                        completed = true
                     elsif text.start_with?('#')
                         next
                     else
@@ -133,7 +136,9 @@ unless defined?(AddonFirewallSafety)
                         end
                     end
                 end
-                raise Error, 'missing or incomplete firewall table' if current || !seen.include?(table)
+                # A fresh nft-backed host may not have instantiated the nat table yet.
+                missing_allowed = allow_missing && ebtables && table == 'nat' && completed
+                raise Error, 'missing or incomplete firewall table' if current || (!seen.include?(table) && !missing_allowed)
                 raise Error, 'rule in undeclared chain' unless @rules.all? { |rule| @chains.key?(rule[1]) }
             rescue ArgumentError => e
                 raise Error, "invalid firewall inventory: #{e.message}"
@@ -187,7 +192,7 @@ unless defined?(AddonFirewallSafety)
                 @inventory ||= begin
                     output, stderr, status = capture(['sudo', '-n', "#{@tool}-save"])
                     raise Error, "#{@tool}-save failed: #{stderr}" unless status.success?
-                    Inventory.new(output, table: @table, ebtables: @tool == 'ebtables')
+                    Inventory.new(output, table: @table, ebtables: @tool == 'ebtables', allow_missing: @tool == 'ebtables')
                 end
             end
 
