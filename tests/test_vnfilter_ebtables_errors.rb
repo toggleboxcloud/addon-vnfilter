@@ -260,4 +260,21 @@ class VnfilterEbtablesErrorsTest < Minitest::Test
         AddonFirewallSafety.with_lock(@filter.firewall_lock_path, nonblocking: true) { assert true }
         assert_empty @fake.calls
     end
+
+    def test_shared_external_alias_uses_parent_mac_and_only_assigned_source_ips
+        @filter.instance_variable_set(:@nics, [
+            { nic_id: '1', mac: '02:00:00:00:00:01', ip: '192.0.2.1', filter_mac_spoofing: 'YES' },
+            { nic_id: '2', alias_id: '0', parent_id: '1', shared: 'YES',
+              mac: '02:00:00:00:ff:99', ip: '192.0.2.219' }
+        ])
+        VnfilterArpGuard.stub(:reconcile, true) { @filter.activate }
+        source = @fake.rules.select { |rule| rule[1] == 'one-42-1-i-arp' }
+        assert_equal %w[-A one-42-1-i-arp -p ARP -s ! 02:00:00:00:00:01 -j DROP], source[0]
+        assert_equal %w[-A one-42-1-i-arp -p ARP --arp-mac-src ! 02:00:00:00:00:01 -j DROP], source[1]
+        whitelist = @fake.rules.select { |rule| rule[1] == 'one-42-1-i-arp4' }
+        assert_equal ['192.0.2.1', '192.0.2.219'], whitelist.map { |rule| rule[rule.index('--arp-ip-src') + 1] }
+        refute @fake.rules.any? { |rule| rule.include?('02:00:00:00:ff:99') }
+        assert_equal 2, @fake.rules.count { |rule| rule[1] == 'one-42-1-o-arp' && rule.include?('--arp-gratuitous') }
+        refute source.any? { |rule| rule.include?('--arp-gratuitous') }
+    end
 end

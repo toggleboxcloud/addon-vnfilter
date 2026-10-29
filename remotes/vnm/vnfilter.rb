@@ -21,6 +21,7 @@ require 'vnmmad'
 require 'syslog/logger'
 require_relative 'arp_guard'
 require_relative 'vnfilter_firewall_safety'
+require_relative 'gratuitous_arp'
 
 # IP filter for aliases
 class VnFilter < VNMMAD::VNMDriver
@@ -153,6 +154,9 @@ class VnFilter < VNMMAD::VNMDriver
             "-j #{chain_i}")
 
         add_ebtables_mutation(commands, "-t nat -N #{chain_o}-arp -P DROP")
+        VnfilterGratuitousArp.rules.each do |rule|
+            add_ebtables_mutation(commands, Shellwords.join(['-t', 'nat', '-A', "#{chain_o}-arp"] + rule))
+        end
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-arp -p ARP "\
             "--arp-op Reply --arp-mac-dst ! #{mac} -j DROP")
         add_ebtables_mutation(commands, "-t nat -A #{chain_o}-arp -p ARP "\

@@ -130,6 +130,8 @@ module VnfilterArpGuardNft
                 verdict = payload['mode'] == 'enforce' ? ' drop' : ''
                 chain = <<~NFT
                     add chain bridge #{TABLE_NAME} prerouting { type filter hook prerouting priority -300; policy accept; }
+                    #{gratuitous_chain}
+                    add rule bridge #{TABLE_NAME} prerouting iifname "#{payload['ingress_interface']}" ether daddr ff:ff:ff:ff:ff:ff ether type arp arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp operation { request, reply } arp saddr ip != 0.0.0.0 arp daddr ip != 0.0.0.0 jump gratuitous
                     add rule bridge #{TABLE_NAME} prerouting iifname "#{payload['ingress_interface']}" ether daddr ff:ff:ff:ff:ff:ff ether type arp arp operation request arp daddr ip != @local_targets counter#{verdict}
                 NFT
             end
@@ -141,6 +143,28 @@ module VnfilterArpGuardNft
                 flush set bridge #{TABLE_NAME} local_targets
                 #{add_elements}#{chain}
             NFT
+        end
+
+        # nft 1.0.9 cannot compare two packet fields directly. Compare each
+        # four-bit group using a constant set of equal pairs. Any mismatch
+        # returns to the normal guard; all eight matches prove SPA == TPA.
+        # This uses no packet marks, learned addresses, or cross-packet state.
+        # The caller must read both complete addresses before entering: a short
+        # payload skips a comparison rule rather than executing its return.
+        def gratuitous_chain
+            lines = ["add chain bridge #{TABLE_NAME} gratuitous"]
+            8.times do |nibble|
+                shift = nibble * 4
+                mask = IPAddr.new(15 << shift, Socket::AF_INET).to_s
+                pairs = 16.times.map do |value|
+                    address = IPAddr.new(value << shift, Socket::AF_INET).to_s
+                    "#{address} . #{address}"
+                end.join(', ')
+                lines << "add rule bridge #{TABLE_NAME} gratuitous " \
+                    "arp saddr ip & #{mask} . arp daddr ip & #{mask} != { #{pairs} } return"
+            end
+            lines << "add rule bridge #{TABLE_NAME} gratuitous counter accept"
+            lines.join("\n")
         end
 
         def verify_ownership(check_only:)
