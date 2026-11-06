@@ -30,11 +30,8 @@ The newest composition has the highest `site/cloud-<version>` branch. Production
 currently runs the 7.4.1 composition. `deployed/cloud-7.0.1` is retired
 naming for the same role, not a newer composition.
 
-Confirm which commit a composition pins rather than assuming — the pin lives in
-`components.tsv` on the `opennebula-one` branch that carries a component lock,
-and nowhere else:
-
-Registry-carrying compositions keep the lock on the matching `opennebula-one`
+Confirm which commit a composition pins rather than assuming. Registry-carrying
+compositions keep the pin in `components.tsv` on the matching `opennebula-one`
 `site/cloud-<version>` branch. The historical `site/cloud-7.2.1` branch carries no
 lock; its historical lock is on `origin/site/cloud-7.2.1r`, and its composed
 installer resolves this repository from `VNFILTER_REPO`.
