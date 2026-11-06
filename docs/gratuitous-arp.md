@@ -91,12 +91,13 @@ Both `802.1Q` and `fw` lifecycle entrypoints use the same builder for new NICs.
 
 ## Ansible handoff and deployment order
 
-The Ansible checkout is maintained separately by the operator. The persistent
-configuration is `/etc/one/vnfilter-arp-guard.conf`. Observed on 2026-10-29:
-hv66 enforces; hv68 and hv70 are disabled. All three use `br0` and `bond0.1`;
-the uplink is VLAN 1 on each, but this alone does not prove a shared L2 domain.
+The authoritative Ansible checkout is `/home/ansible` on noc1. The persistent
+configuration is `/etc/one/vnfilter-arp-guard.conf`. Before the cloud-dev rollout
+on 2026-10-29, hv66 enforced and hv68/hv70 were disabled. All three now enforce.
+All three use `br0` and `bond0.1`, with uplink VLAN 1. Revalidate each production
+host's bridge, uplink and intended L2 domain before copying these settings.
 
-Required changes to that owning role:
+Deployment order:
 
 1. Pin the reviewed addon revision. Deploy `host/vnfilter_arp_guard_nft` through
    the owning host installer (`HOST_INSTALL=1 ./install.sh`) or the role's
@@ -105,9 +106,14 @@ Required changes to that owning role:
    prerequisites and can install gems if missing; confirm they are already
    present before scheduling it as a helper-only update.
 2. Deploy frontend remotes with `./install.sh --no-hooks --no-sync`, then sync
-   only the approved hosts. The manifest adds `vnm/gratuitous_arp.rb` and updates
+   only the approved hosts with `onehost sync <approved-host-IDs> --force`.
+   Resolve IDs against the intended controller first. SSH-mode sync (`--ssh`)
+   failed on the development canary; standard scoped sync succeeded.
+   The manifest adds `vnm/gratuitous_arp.rb` and updates
    `vnm/vnfilter.rb`. Verify bytes and modes on each host, including the root
-   helper; host sync does not install that helper.
+   helper; host sync does not install that helper. Required modes are 0644 for
+   `vnm/vnfilter.rb`, 0755 for `vnm/gratuitous_arp.rb`, and root:root 0755 for
+   `/usr/local/sbin/vnfilter-arp-guard-nft`.
 3. Run the existing-VM refresh above on a canary. Test shared-IP announcements
    to an ordinary client and confirm unowned request suppression before
    proceeding. Preserve the current guard modes until each host passes.
@@ -130,3 +136,81 @@ and Ansible, sync approved hosts and reconcile the guard. Verify the original
 receive rules and client reachability. The old enforcing rules restore the
 known GARP limitation. Do not run the broad broadcast-blocking script: it
 flushes unrelated FORWARD rules.
+
+
+## Cloud-dev rollout evidence and production handoff
+
+Deployed on 2026-10-29 from addon revision
+`cbbe69eab092e5e191025d7281ea1b8d0ebcefcb`. The frontend installer passed its
+content/mode check. hv66 passed the canary before serial deployment to hv68 and
+hv70. All three enforce after Ansible convergence, with active, enabled timers
+and verified GARP/suppression rules. Final receive-chain checks reported 22 on
+hv66, 21 on hv68 and zero on hv70. Counts changed during VM lifecycle activity;
+compare fresh NIC inventories at acceptance. hv70 had no br0 VM NICs.
+
+### Ansible sources and helper promotion
+
+The authoritative checkout on noc1 contains:
+
+- `playbooks/deploy-cloud-dev-gratuitous-arp.yml`: frontend install, scoped
+  sync, rollback captures, running-chain refresh and serial guard deployment.
+  Its targets and controller IDs are specific to development. Create a
+  separately scoped production rollout; `--limit` cannot retarget this playbook.
+- `roles/opennebula_node/tasks/vnfilter_arp_guard.yml`: the owning role accepts
+  the host variable `opennebula_vnfilter_arp_guard_helper_source`.
+- hv66/hv68/hv70 pin that variable to
+  `/home/ansible/files/vnfilter/cbbe69eab092e5e191025d7281ea1b8d0ebcefcb/vnfilter_arp_guard_nft`.
+  The generic role default still uses the older
+  `/home/ansible/files/vnfilter_arp_guard_nft`. Promote the reviewed helper pin
+  explicitly for approved production hosts before role convergence; otherwise
+  later Ansible runs can restore the older helper. Verify the production
+  composition pin and frontend source independently.
+
+The deployed helper SHA-256 is
+`f0f895d33c1c7262bedeadf05e4f3e2411ec562a033aad9a3184bbc1b0976c71`.
+Ansible changes were left uncommitted at handoff; review their current status
+before preparing production deployment.
+
+### Legacy-chain preflight
+
+hv68's refresh initially stopped with
+`unexpected receive chain one-10419-0-o-arp` before changing rules. Eighteen
+legacy receive chains had no references, tap interfaces or libvirt domains.
+Some were empty; others retained a three-rule layout without the IPv4 target
+whitelist. The rollout validated every candidate under the VNM lifecycle lock
+before flushing/deleting only those orphan chains, then reran the refresh.
+Original files and firewall inventories were retained.
+
+Inspect production receive-chain layouts before scheduling the refresh. If this
+error occurs, establish current chain references, NIC/domain ownership and
+lifecycle state. The hv68 cleanup is an exact development-only list, not a
+production cleanup procedure. Preserve active or ambiguous chains; do not
+weaken the refresh validator to accept an unknown layout.
+
+### Acceptance evidence and remaining checks
+
+- Ruby suites and root manifest-confinement tests passed. The isolated packet
+  suite passed 90 cases, including 1,000/1,000 unowned requests suppressed,
+  shared-IP neighbor replacement and refresh/rollback. It ran on hv66 because
+  the cloud-dev frontend lacks ebtables. Keepalived was omitted.
+- Retained lab VMs 18933 on hv66 and 18934 on hv68 received all four GARP
+  Request/Reply and zero/broadcast target-MAC forms in both directions after
+  enforcement and Ansible convergence. Each receiver lacked the announced
+  primary address. Peer ping passed 2/2 in both directions; shared-VIP ping
+  also passed 2/2. Guard drop counters rose during unowned-request probes;
+  background traffic also contributed to those live counters.
+- Nineteen focused Ansible tests passed. Five fake-backend checks covered orphan
+  cleanup and refusal of referenced chains, existing domains and unknown
+  layouts. Convergence showed no file drift; live runs reran the oneshot guard
+  reconciler without changing files.
+- Reboot persistence, Keepalived election/takeover and multicast VRRP were not
+  validated during this rollout. Packet tests do not establish production
+  switch policy or application HA behavior. Repeat canary traffic and
+  suppression checks in the actual production domain.
+
+Controller evidence is under
+`/home/ansible/artifacts/vnfilter-garp-cbbe69e/`. Private rollback captures are
+under `/var/tmp/vnfilter-garp-cbbe69e/` on cloud-dev and each node. Keep raw
+firewall inventories and lab captures out of this repository. These paths and
+VM IDs describe development; confirm they still exist before reuse and retain
+fresh production rollback material.
