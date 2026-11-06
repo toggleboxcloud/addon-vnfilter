@@ -24,17 +24,10 @@ spoof filtering on attach, detach and hotplug, and ARP filtering when
 - `master` — development trunk. This is our own repo, so trunk is authoritative.
 - `site/cloud-<version>` — integrated composition pinned by the matching
   `opennebula-one` site branch.
-- `deployed/<ref>` — older naming for the same role as `site/*`. Being retired.
 
-The newest composition has the highest `site/cloud-<version>` branch. Production
-currently runs the 7.4.1 composition. `deployed/cloud-7.0.1` is retired
-naming for the same role, not a newer composition.
-
-Confirm which commit a composition pins rather than assuming. Registry-carrying
-compositions keep the pin in `components.tsv` on the matching `opennebula-one`
-`site/cloud-<version>` branch. The historical `site/cloud-7.2.1` branch carries no
-lock; its historical lock is on `origin/site/cloud-7.2.1r`, and its composed
-installer resolves this repository from `VNFILTER_REPO`.
+Production runs the 7.4.1 composition. Confirm its pinned commit in
+`site/cloud-7.4.1/components.tsv` in `opennebula-one`.
+Retired compositions are preserved under `archive/retired-2026-11-06/*` tags.
 
 This file and its `CLAUDE.md` symlink are committed on `master` and maintained
 `site/*` branches and must stay byte-identical; change it everywhere or
