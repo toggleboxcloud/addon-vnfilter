@@ -1,5 +1,15 @@
 # `addon-vnfilter`
 
+## Supported OpenNebula version
+
+Production is fully running OpenNebula 7.4.1 Community Edition, as confirmed
+by the user on 2026-11-06. New development, fixes, and validation target 7.4.1.
+Compatibility with 7.2.x and backports to 7.2.x are not required unless the
+user explicitly requests them. Older branch and installer notes below describe
+historical implementations, not the current production baseline. Verify the
+installed commit and component pins before making deployment claims; this
+version policy does not change readiness gates or authorize deployment.
+
 Own repository. Canonical path `/var/lib/one/repos/addon-vnfilter`.
 `origin` is `toggleboxcloud/addon-vnfilter`; `upstream` is
 `storpool/addon-vnfilter`, the project this was derived from — read-only in
@@ -17,7 +27,7 @@ spoof filtering on attach, detach and hotplug, and ARP filtering when
 - `deployed/<ref>` — older naming for the same role as `site/*`. Being retired.
 
 The newest composition has the highest `site/cloud-<version>` branch. Production
-currently installs from `site/cloud-7.2.1`. `deployed/cloud-7.0.1` is retired
+currently runs the 7.4.1 composition. `deployed/cloud-7.0.1` is retired
 naming for the same role, not a newer composition.
 
 Confirm which commit a composition pins rather than assuming — the pin lives in
@@ -25,7 +35,7 @@ Confirm which commit a composition pins rather than assuming — the pin lives i
 and nowhere else:
 
 Registry-carrying compositions keep the lock on the matching `opennebula-one`
-`site/cloud-<version>` branch. The deployed `site/cloud-7.2.1` branch carries no
+`site/cloud-<version>` branch. The historical `site/cloud-7.2.1` branch carries no
 lock; its historical lock is on `origin/site/cloud-7.2.1r`, and its composed
 installer resolves this repository from `VNFILTER_REPO`.
 
