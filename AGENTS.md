@@ -2,13 +2,13 @@
 
 ## Supported OpenNebula version
 
-Production is fully running OpenNebula 7.4.1 Community Edition, as confirmed
-by the user on 2026-11-06. New development, fixes, and validation target 7.4.1.
-Compatibility with 7.2.x and backports to 7.2.x are not required unless the
-user explicitly requests them. Older branch and installer notes below describe
-historical implementations, not the current production baseline. Verify the
-installed commit and component pins before making deployment claims; this
-version policy does not change readiness gates or authorize deployment.
+Production runs OpenNebula 7.4.1 Community Edition. New development, fixes,
+and validation target 7.4.1. Compatibility with 7.2.x and backports to 7.2.x
+are not required unless the user explicitly requests them. Older branch and
+installer notes below describe historical implementations, not the current
+production baseline. Verify the installed commit and component pins before
+making deployment claims; this version policy does not change readiness gates
+or authorize deployment.
 
 Own repository. Canonical path `/var/lib/one/repos/addon-vnfilter`.
 `origin` is `toggleboxcloud/addon-vnfilter`; `upstream` is
