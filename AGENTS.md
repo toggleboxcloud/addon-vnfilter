@@ -37,8 +37,8 @@ lock; its historical lock is on `origin/site/cloud-7.2.1r`, and its composed
 installer resolves this repository from `VNFILTER_REPO`.
 
 This file and its `CLAUDE.md` symlink are committed on `master` and maintained
-`site/*` branches and must stay byte-identical. Keep this text version-generic;
-change it everywhere or nowhere.
+`site/*` branches and must stay byte-identical; change it everywhere or
+nowhere.
 
 ## Layout
 
